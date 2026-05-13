@@ -303,6 +303,32 @@ pub(crate) fn update_mcp_tool_count(server_name: &str, count: usize) {
     }
 }
 
+/// Build the `[{name, tools}]` array that the sidebar consumes for
+/// the MCP servers list. Shared by `build_mcp_update_payload` AND
+/// by both `initial_state` builders (`gui.rs` desktop bootstrap +
+/// `server.rs` serve-mode WS connect) so every surface ships real
+/// counts. Pre-fix the initial-state builders hardcoded `tools: 0`,
+/// which wiped any cached counts on every WS reconnect (issue #86).
+///
+/// `config.mcp_servers` already merges user-level
+/// (`~/.config/thclaws/mcp.json`) and project-level
+/// (`.thclaws/mcp.json` / `.mcp.json` / `.claude/mcp.json`) scopes
+/// per `AppConfig::load` — project overrides user by name. Both
+/// scopes flow through unchanged here.
+pub(crate) fn build_mcp_servers_payload(
+    config: &crate::config::AppConfig,
+) -> Vec<serde_json::Value> {
+    let counts = mcp_tool_counts().lock().unwrap_or_else(|e| e.into_inner());
+    config
+        .mcp_servers
+        .iter()
+        .map(|s| {
+            let tool_count = counts.get(&s.name).copied().unwrap_or(0);
+            serde_json::json!({"name": s.name, "tools": tool_count})
+        })
+        .collect()
+}
+
 /// Build the `mcp_update` IPC payload: the configured MCP servers for
 /// this session (read fresh from disk so removals via `/mcp remove` are
 /// reflected immediately, not after a restart). Tool counts come from
@@ -310,15 +336,7 @@ pub(crate) fn update_mcp_tool_count(server_name: &str, count: usize) {
 /// once each server successfully connects and lists its tools.
 pub(crate) fn build_mcp_update_payload() -> serde_json::Value {
     let config = crate::config::AppConfig::load().unwrap_or_default();
-    let counts = mcp_tool_counts().lock().unwrap_or_else(|e| e.into_inner());
-    let servers: Vec<serde_json::Value> = config
-        .mcp_servers
-        .iter()
-        .map(|s| {
-            let tool_count = counts.get(&s.name).copied().unwrap_or(0);
-            serde_json::json!({"name": s.name, "tools": tool_count})
-        })
-        .collect();
+    let servers = build_mcp_servers_payload(&config);
     serde_json::json!({
         "type": "mcp_update",
         "servers": servers,
@@ -1094,11 +1112,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                 }
                 let provider_name = config.detect_provider().unwrap_or("unknown");
                 let provider_ready = provider_has_credentials(&config);
-                let mcp_servers: Vec<serde_json::Value> = config
-                    .mcp_servers
-                    .iter()
-                    .map(|s| serde_json::json!({"name": s.name, "tools": 0}))
-                    .collect();
+                let mcp_servers = build_mcp_servers_payload(&config);
                 let sessions: Vec<serde_json::Value> = SessionStore::default_path()
                     .map(SessionStore::new)
                     .and_then(|store| store.list().ok())

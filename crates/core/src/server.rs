@@ -372,11 +372,10 @@ fn build_initial_state_payload() -> String {
     }
     let provider_name = config.detect_provider().unwrap_or("unknown");
     let provider_ready = provider_has_credentials(&config);
-    let mcp_servers: Vec<serde_json::Value> = config
-        .mcp_servers
-        .iter()
-        .map(|s| serde_json::json!({ "name": s.name, "tools": 0 }))
-        .collect();
+    // Consult the live MCP_TOOL_COUNTS cache (populated by the
+    // McpReady worker event) so reconnect-after-startup ships real
+    // counts instead of the hardcoded zeros that surfaced as issue #86.
+    let mcp_servers = crate::gui::build_mcp_servers_payload(&config);
     let sessions: Vec<serde_json::Value> = SessionStore::default_path()
         .map(SessionStore::new)
         .and_then(|store| store.list().ok())

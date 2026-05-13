@@ -1784,12 +1784,11 @@ async fn run_worker(
                     )));
                 }
                 // Update sidebar with real tool count now that the server is live.
-                #[cfg(feature = "gui")]
-                {
-                    crate::gui::update_mcp_tool_count(&server_name, tool_count);
-                    let payload = crate::gui::build_mcp_update_payload();
-                    let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
-                }
+                // (No `cfg(feature = "gui")` — the whole module is already
+                // gated at file scope; the inner cfg block was redundant.)
+                crate::gui::update_mcp_tool_count(&server_name, tool_count);
+                let payload = crate::gui::build_mcp_update_payload();
+                let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
             }
             ShellInput::McpFailed { server_name, error } => {
                 let _ = events_tx.send(ViewEvent::ErrorText(format!(
