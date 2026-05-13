@@ -1,0 +1,37 @@
+{
+  "name": "@thclaws/paperclip-adapter",
+  "version": "0.1.0",
+  "description": "Paperclip adapter for thClaws — hire a thClaws agent inside a Paperclip company orchestration.",
+  "type": "module",
+  "license": "MIT",
+  "author": "thClaws contributors",
+  "homepage": "https://github.com/thClaws/thClaws",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thClaws/thClaws.git",
+    "directory": "paperclip-adapter"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/server/index.js",
+    "./ui-parser": "./dist/ui-parser.js"
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@paperclipai/adapter-utils": "^2026.325.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
