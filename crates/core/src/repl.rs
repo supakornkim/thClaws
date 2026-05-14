@@ -13,7 +13,8 @@ use crate::memory::MemoryStore;
 use crate::permissions::{PermissionMode, ReplApprover};
 use crate::providers::{
     anthropic::AnthropicProvider, gemini::GeminiProvider, ollama::OllamaProvider,
-    ollama_cloud::OllamaCloudProvider, openai::OpenAIProvider, Provider, ProviderKind,
+    ollama_cloud::OllamaCloudProvider, openai::OpenAIProvider, opencode_go::OpencodeGoProvider,
+    Provider, ProviderKind,
 };
 use crate::session::{Session, SessionStore};
 use crate::subagent::{ProductionAgentFactory, SubAgentTool};
@@ -3090,8 +3091,18 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
     match kind {
         ProviderKind::AgentSdk => {
             let bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+            // SDK MCP bridge: Claude Code's built-in tools are
+            // disabled (via --allowedTools) and thClaws's tool
+            // registry is exposed over the in-process SDK MCP
+            // channel. The model sees `mcp__thclaws__KmsWrite`,
+            // `mcp__thclaws__Bash`, … instead of Claude Code's
+            // Write/Bash/etc. Solves the long-standing UX gap
+            // where KMS / Memory tools were unreachable on agent/*.
+            let tools = crate::providers::agent_sdk::AgentSdkProvider::with_default_thclaws_tools();
             return Ok(Arc::new(
-                crate::providers::agent_sdk::AgentSdkProvider::new().with_bin(bin),
+                crate::providers::agent_sdk::AgentSdkProvider::new()
+                    .with_bin(bin)
+                    .with_tools(tools),
             ));
         }
         ProviderKind::Ollama => {
@@ -3180,18 +3191,57 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
             // OpenAI-compatible; models use openrouter/<vendor>/<model> form
             // (e.g. openrouter/anthropic/claude-sonnet-4-6). Strip the
             // "openrouter/" prefix before forwarding to the upstream API.
+            let overlay = crate::providers::thclaws_gateway::for_kind(config, kind);
+            let (key, base) = match overlay {
+                Some(o) => (
+                    o.access_key,
+                    format!("{}/api/v1/chat/completions", o.base_url),
+                ),
+                None => (
+                    api_key,
+                    "https://openrouter.ai/api/v1/chat/completions".to_string(),
+                ),
+            };
             Ok(Arc::new(
-                OpenAIProvider::new(api_key)
-                    .with_base_url("https://openrouter.ai/api/v1/chat/completions")
+                OpenAIProvider::new(key)
+                    .with_base_url(base)
                     .with_strip_model_prefix("openrouter/"),
             ))
         }
-        ProviderKind::Anthropic => Ok(Arc::new(AnthropicProvider::new(api_key))),
-        ProviderKind::OpenAI => Ok(Arc::new(OpenAIProvider::new(api_key))),
+        ProviderKind::Anthropic => {
+            let overlay = crate::providers::thclaws_gateway::for_kind(config, kind);
+            let provider = match overlay {
+                // Gateway preserves Anthropic's `/v1/messages` path; the
+                // gateway injects the real x-api-key + anthropic-version
+                // upstream. Desktop keeps its native `x-api-key: …`
+                // header — gateway recognises that scheme as the
+                // access-key carrier.
+                Some(o) => AnthropicProvider::new(o.access_key)
+                    .with_base_url(format!("{}/v1/messages", o.base_url)),
+                None => AnthropicProvider::new(api_key),
+            };
+            Ok(Arc::new(provider))
+        }
+        ProviderKind::OpenAI => {
+            let overlay = crate::providers::thclaws_gateway::for_kind(config, kind);
+            let provider = match overlay {
+                Some(o) => OpenAIProvider::new(o.access_key)
+                    .with_base_url(format!("{}/v1/chat/completions", o.base_url)),
+                None => OpenAIProvider::new(api_key),
+            };
+            Ok(Arc::new(provider))
+        }
         ProviderKind::OpenAIResponses => Ok(Arc::new(
             crate::providers::openai_responses::OpenAIResponsesProvider::new(api_key),
         )),
-        ProviderKind::Gemini => Ok(Arc::new(GeminiProvider::new(api_key))),
+        ProviderKind::Gemini => {
+            let overlay = crate::providers::thclaws_gateway::for_kind(config, kind);
+            let provider = match overlay {
+                Some(o) => GeminiProvider::new(o.access_key).with_base_url(o.base_url),
+                None => GeminiProvider::new(api_key),
+            };
+            Ok(Arc::new(provider))
+        }
         ProviderKind::DashScope => {
             let base = std::env::var("DASHSCOPE_BASE_URL").unwrap_or_else(|_| {
                 "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()
@@ -3353,6 +3403,20 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
                     .with_strip_model_prefix("nvidia/"),
             ))
         }
+        ProviderKind::OpenCodeGo => {
+            // OpenCodeGo (opencode.ai) — multi-format hosted gateway.
+            // Routes to the correct endpoint based on model id:
+            // OpenAI-compatible (/chat/completions), Anthropic-compatible
+            // (/messages), or Alibaba-compatible (/chat/completions).
+            // Models use the `opencode-go/<id>` prefix. The base URL can
+            // be overridden via OPENCODE_GO_BASE_URL for self-hosted proxies.
+            let base = std::env::var("OPENCODE_GO_BASE_URL")
+                .unwrap_or_else(|_| "https://opencode.ai/zen/go/v1".to_string());
+            Ok(Arc::new(
+                OpencodeGoProvider::new(api_key).with_base_url(base),
+            ))
+        }
+
         ProviderKind::Ollama
         | ProviderKind::OllamaAnthropic
         | ProviderKind::LMStudio
@@ -3418,6 +3482,7 @@ pub async fn build_provider_with_fallback(
         ProviderKind::QwenCloud,
         ProviderKind::ZAi,
         ProviderKind::ThaiLLM,
+        ProviderKind::OpenCodeGo,
         ProviderKind::Ollama,
         ProviderKind::OllamaAnthropic,
         ProviderKind::OllamaCloud,

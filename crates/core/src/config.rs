@@ -131,6 +131,18 @@ pub struct AppConfig {
     #[serde(default)]
     pub openrouter_free_only: bool,
 
+    /// Per-provider gateway routing. Each entry is a provider name
+    /// (lowercase, matches the gateway path segment): `openai`,
+    /// `anthropic`, `google`, `openrouter`. When the active model's
+    /// `ProviderKind` matches one of these names AND the gateway
+    /// access key is available (keychain or `THCLAWS_GATEWAY_API_KEY`
+    /// env var), the provider's HTTP layer rewrites its base URL +
+    /// auth header to route through the gateway. The gateway base URL
+    /// itself is fixed at `crate::providers::thclaws_gateway::GATEWAY_BASE_URL`
+    /// — see that module for the staging override env var.
+    #[serde(default)]
+    pub gateway_use_for: Vec<String>,
+
     /// Per-skill model recommendations from settings.json. Overrides the
     /// `model:` field declared in the SKILL.md frontmatter for the named
     /// built-in skill. Lets users say "for my extract-and-save runs use
@@ -196,6 +208,7 @@ impl Default for AppConfig {
             kms_active: Vec::new(),
             claude_md_compat: false,
             openrouter_free_only: false,
+            gateway_use_for: Vec::new(),
             extract_save_skill_models: None,
             translator_subagent_model: None,
         }
@@ -371,6 +384,13 @@ pub struct ProjectConfig {
     /// compiled default (`false`).
     #[serde(rename = "openrouterFreeOnly")]
     pub openrouter_free_only: Option<bool>,
+    /// Provider names to route through the thClaws Gateway: any
+    /// subset of `["openai", "anthropic", "google", "openrouter"]`.
+    /// Base URL is fixed (see
+    /// `crate::providers::thclaws_gateway::GATEWAY_BASE_URL`); only
+    /// per-provider opt-in lives in user-visible config.
+    #[serde(rename = "gatewayUseFor")]
+    pub gateway_use_for: Option<Vec<String>>,
 }
 
 fn null_team_enabled_is_false<'de, D>(d: D) -> std::result::Result<Option<bool>, D::Error>
@@ -402,6 +422,7 @@ impl Default for ProjectConfig {
             show_raw_response: None,
             kms: None,
             openrouter_free_only: None,
+            gateway_use_for: None,
         }
     }
 }
@@ -599,6 +620,13 @@ impl ProjectConfig {
         if let Some(b) = self.openrouter_free_only {
             config.openrouter_free_only = b;
         }
+        if let Some(ref providers) = self.gateway_use_for {
+            config.gateway_use_for = providers
+                .iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
     }
 
     pub fn set_model(&mut self, model: &str) {
@@ -619,6 +647,17 @@ impl ProjectConfig {
     /// rewrites whenever the user flips `/permissions`.
     pub fn set_permissions_mode(&mut self, mode: &str) {
         self.permissions = Some(PermissionsConfig::Mode(mode.to_string()));
+    }
+
+    /// Persist the set of providers routed through the gateway.
+    pub fn set_gateway_use_for(&mut self, providers: Vec<String>) {
+        self.gateway_use_for = Some(
+            providers
+                .into_iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        );
     }
 
     /// Load project-level MCP servers. Checks (in order):

@@ -1,10 +1,27 @@
 //! Minimal HTTP listener for the OIDC redirect URI.
 //!
 //! Public OIDC clients can't use a real callback URL (no server), so
-//! the standard pattern for desktop apps is `http://127.0.0.1:<random>/
-//! callback`. We open a `TcpListener` on a kernel-assigned port,
-//! register that exact URL with the IdP at authorize time, and the
-//! browser delivers the authcode back to us via a GET request.
+//! the standard pattern for desktop apps is `http://localhost:<random>/`.
+//! We open a `TcpListener` on a kernel-assigned port, register that
+//! exact URL with the IdP at authorize time, and the browser delivers
+//! the authcode back to us via a GET request.
+//!
+//! ## Why `localhost` and not `127.0.0.1`
+//!
+//! Azure / Microsoft Entra ID treats `localhost` and `127.0.0.1` as
+//! **different hosts** for redirect-URI matching. Its app-registration
+//! UX wants you to register `http://localhost` (no port — Microsoft
+//! wildcards the port AND accepts any of `http://localhost`,
+//! `http://localhost:<port>`, `http://localhost:<port>/` as
+//! equivalent to that registration). So the loopback URI we emit
+//! has to use `localhost` literally, even though we bind to the
+//! `127.0.0.1` IPv4 address — the browser's libc resolver maps
+//! `localhost` → `127.0.0.1` on every default macOS / Linux / Windows
+//! config (per RFC 6761).
+//!
+//! Google is more permissive — it accepts both `localhost` and
+//! `127.0.0.1` forms for desktop clients, so the `localhost` choice
+//! works for both providers from a single registration.
 //!
 //! The implementation reads exactly one HTTP request, extracts the
 //! `code` and `state` query parameters, returns a small "you can close
@@ -47,9 +64,12 @@ impl LoopbackServer {
     }
 
     /// The redirect URI to send to the IdP — matches what the browser
-    /// will hit when the user finishes login.
+    /// will hit when the user finishes login. Uses `localhost` (not
+    /// `127.0.0.1`) so the URI lines up with an Azure portal
+    /// registration of `http://localhost`; see the module docstring
+    /// for the matching rules.
     pub fn redirect_uri(&self) -> String {
-        format!("http://127.0.0.1:{}/callback", self.port)
+        format!("http://localhost:{}/", self.port)
     }
 
     /// Accept exactly one HTTP request, parse the query string, return
@@ -207,7 +227,10 @@ mod tests {
 
     #[test]
     fn parses_callback_with_code_and_state() {
-        let line = "GET /callback?code=abc123&state=xyz HTTP/1.1\r\n";
+        // Root path — matches the `http://localhost:<port>/` shape
+        // we now emit so Azure's `http://localhost` redirect-URI
+        // registration accepts the redirect (see module docstring).
+        let line = "GET /?code=abc123&state=xyz HTTP/1.1\r\n";
         let r = parse_request_line(line);
         assert_eq!(r.code.as_deref(), Some("abc123"));
         assert_eq!(r.state.as_deref(), Some("xyz"));
@@ -216,12 +239,23 @@ mod tests {
 
     #[test]
     fn parses_callback_with_error() {
-        let line =
-            "GET /callback?error=access_denied&error_description=user+cancelled HTTP/1.1\r\n";
+        let line = "GET /?error=access_denied&error_description=user+cancelled HTTP/1.1\r\n";
         let r = parse_request_line(line);
         assert_eq!(r.error.as_deref(), Some("access_denied"));
         assert_eq!(r.error_description.as_deref(), Some("user cancelled"));
         assert!(r.code.is_none());
+    }
+
+    #[test]
+    fn parser_tolerates_callback_path_for_back_compat() {
+        // Earlier loopback URIs used `/callback`; the parser stays
+        // tolerant so any IdP that mirrors back an arbitrary path
+        // (or a user with a cached redirect from an older build)
+        // still gets parsed correctly.
+        let line = "GET /callback?code=abc&state=xyz HTTP/1.1\r\n";
+        let r = parse_request_line(line);
+        assert_eq!(r.code.as_deref(), Some("abc"));
+        assert_eq!(r.state.as_deref(), Some("xyz"));
     }
 
     #[test]
@@ -240,7 +274,7 @@ mod tests {
 
     #[test]
     fn empty_query_returns_empty_result() {
-        let line = "GET /callback HTTP/1.1\r\n";
+        let line = "GET / HTTP/1.1\r\n";
         let r = parse_request_line(line);
         assert!(r.code.is_none());
         assert!(r.state.is_none());
@@ -257,5 +291,28 @@ mod tests {
         let server = LoopbackServer::bind().expect("bind");
         assert!(server.port > 0);
         assert!(server.redirect_uri().contains(&server.port.to_string()));
+    }
+
+    /// Azure rejects the OAuth authorize request when redirect_uri's
+    /// host is `127.0.0.1` but the portal registration uses
+    /// `localhost`. Pin the URI shape so a future refactor doesn't
+    /// silently re-introduce the regression.
+    #[test]
+    fn redirect_uri_uses_localhost_host_and_root_path() {
+        let server = LoopbackServer::bind().expect("bind");
+        let uri = server.redirect_uri();
+        assert!(
+            uri.starts_with("http://localhost:"),
+            "expected localhost host, got: {uri}"
+        );
+        assert!(uri.ends_with('/'), "expected root path, got: {uri}");
+        assert!(
+            !uri.contains("127.0.0.1"),
+            "must not use 127.0.0.1 (breaks Azure match): {uri}"
+        );
+        assert!(
+            !uri.contains("/callback"),
+            "redirect must not carry a /callback suffix (breaks Azure 'http://localhost' registration match): {uri}"
+        );
     }
 }

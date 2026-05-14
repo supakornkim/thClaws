@@ -31,11 +31,16 @@ use crate::event_render::{
 use crate::ipc::{handle_ipc, IpcContext, PendingAsks};
 use crate::providers::provider_has_credentials;
 use crate::session::SessionStore;
-use crate::shared_session::{SharedSessionHandle, ViewEvent};
+use crate::shared_session::{SharedSessionHandle, ShellInput, ViewEvent};
+use crate::uploads::{
+    ensure_uploads_dir, render_upload_message, unique_path, UploadedFile, UPLOADS_DIRNAME,
+    UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES,
+};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::extract::{Multipart, State};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Json, Response};
+use axum::routing::{get, post};
 use axum::Router;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -51,6 +56,11 @@ const FRONTEND_HTML: &str = include_str!("../../../frontend/dist/index.html");
 #[derive(Clone)]
 pub struct ServeConfig {
     pub bind: SocketAddr,
+    /// Workspace root used for upload destinations and (future)
+    /// sandbox scoping. `None` means "use process cwd at `run` time",
+    /// which is the production default. Tests inject a tempdir to
+    /// avoid touching global cwd.
+    pub workspace: Option<std::path::PathBuf>,
 }
 
 impl Default for ServeConfig {
@@ -60,6 +70,7 @@ impl Default for ServeConfig {
             // tunnel handles auth". Override via --bind if you know
             // what you're doing.
             bind: ([127, 0, 0, 1], 8443).into(),
+            workspace: None,
         }
     }
 }
@@ -82,6 +93,7 @@ struct ServeState {
     approver: Arc<crate::permissions::GuiApprover>,
     pending_asks: PendingAsks,
     ask_broadcast: broadcast::Sender<String>,
+    workspace: Arc<std::path::PathBuf>,
 }
 
 /// Spin up the server. Spawns the worker, builds the Axum router,
@@ -159,17 +171,24 @@ pub async fn run_with_engine(
     pending_asks: PendingAsks,
     ask_broadcast: broadcast::Sender<String>,
 ) -> crate::error::Result<()> {
+    let workspace = match config.workspace.clone() {
+        Some(p) => p,
+        None => std::env::current_dir()
+            .map_err(|e| crate::error::Error::Tool(format!("workspace cwd unavailable: {e}")))?,
+    };
     let state = ServeState {
         shared,
         approver,
         pending_asks,
         ask_broadcast,
+        workspace: Arc::new(workspace),
     };
 
     let app = Router::new()
         .route("/", get(serve_index))
         .route("/healthz", get(serve_health))
         .route("/ws", get(ws_handler))
+        .route("/upload", post(serve_upload))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind)
@@ -192,6 +211,145 @@ async fn serve_index() -> impl IntoResponse {
 
 async fn serve_health() -> impl IntoResponse {
     "ok"
+}
+
+/// `POST /upload` — multipart file upload from the --serve browser
+/// surface. Each part lands at `<workspace>/uploads/<name>` (with
+/// `_N` suffix on collision). After all parts are saved, the handler
+/// synthesizes a chat-shaped user message and pushes it through the
+/// shared session input pipe — the agent reacts as if the user had
+/// typed a description of what they just uploaded, and project
+/// `AGENTS.md` instructions steer what happens next.
+///
+/// Returns `{ "ok": true, "files": [{ "path": …, "size": … }, …] }`
+/// so the frontend can show a confirmation chip per file. Caps:
+/// [`UPLOAD_MAX_BYTES`] per file, [`UPLOAD_MAX_FILES`] per request.
+/// Oversize / overflow is rejected with 413.
+async fn serve_upload(
+    State(state): State<ServeState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let workspace = state.workspace.as_ref();
+    let uploads_dir = match ensure_uploads_dir(workspace) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("cannot create uploads dir: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut saved: Vec<UploadedFile> = Vec::new();
+    while let Some(field) = match multipart.next_field().await {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("malformed multipart: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    } {
+        if saved.len() >= UPLOAD_MAX_FILES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("at most {UPLOAD_MAX_FILES} files per request"),
+                })),
+            )
+                .into_response();
+        }
+        let filename = field
+            .file_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "upload".to_string());
+        let media_type = field.content_type().map(|s| s.to_string());
+        let dest = unique_path(&uploads_dir, &filename);
+        let bytes = match field.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("read part bytes: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        if bytes.len() as u64 > UPLOAD_MAX_BYTES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "{} exceeds {}-byte cap",
+                        filename, UPLOAD_MAX_BYTES
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        if let Err(e) = std::fs::write(&dest, &bytes) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("write {}: {e}", dest.display()),
+                })),
+            )
+                .into_response();
+        }
+        let relative_path = dest
+            .strip_prefix(workspace)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| format!("{UPLOADS_DIRNAME}/{filename}"));
+        saved.push(UploadedFile {
+            relative_path,
+            media_type,
+            size_bytes: bytes.len() as u64,
+        });
+    }
+
+    if saved.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "no files in request",
+            })),
+        )
+            .into_response();
+    }
+
+    let synth = render_upload_message("serve", &saved);
+    let _ = state.shared.input_tx.send(ShellInput::Line(synth));
+
+    let files: Vec<serde_json::Value> = saved
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "path": f.relative_path,
+                "size": f.size_bytes,
+                "media_type": f.media_type,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "files": files })),
+    )
+        .into_response()
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ServeState>) -> Response {
@@ -477,7 +635,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let cfg = ServeConfig { bind: addr };
+        let cfg = ServeConfig {
+            bind: addr,
+            ..Default::default()
+        };
         let server_handle = tokio::spawn(async move {
             let _ = run(cfg).await;
         });
@@ -551,6 +712,78 @@ mod tests {
 
         // Clean shutdown.
         let _ = ws.send(WsMessage::Close(None)).await;
+        server_handle.abort();
+    }
+
+    /// `POST /upload` saves a multipart file to `<workspace>/uploads/`,
+    /// applies `_N` suffix on collision. Workspace is injected via
+    /// `ServeConfig.workspace` so the test doesn't touch process cwd
+    /// (which would race with other tests in the same binary).
+    #[tokio::test]
+    async fn upload_post_saves_to_workspace_uploads_dir() {
+        use std::time::Duration;
+
+        let td = tempfile::tempdir().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = ServeConfig {
+            bind: addr,
+            workspace: Some(td.path().to_path_buf()),
+        };
+        let server_handle = tokio::spawn(async move {
+            let _ = run(cfg).await;
+        });
+
+        let healthz_url = format!("http://{addr}/healthz");
+        for _ in 0..50 {
+            if reqwest::get(&healthz_url).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let upload_url = format!("http://{addr}/upload");
+        let body_a = vec![0u8; 16];
+        let part_a = reqwest::multipart::Part::bytes(body_a.clone())
+            .file_name("photo.jpg")
+            .mime_str("image/jpeg")
+            .unwrap();
+        let form = reqwest::multipart::Form::new().part("file", part_a);
+
+        let resp = reqwest::Client::new()
+            .post(&upload_url)
+            .multipart(form)
+            .send()
+            .await
+            .expect("upload POST");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["ok"], serde_json::Value::Bool(true));
+        assert_eq!(json["files"][0]["path"], "uploads/photo.jpg");
+        assert_eq!(json["files"][0]["size"], 16);
+
+        assert!(td.path().join("uploads").join("photo.jpg").exists());
+
+        // Second upload with the same name → `_1` suffix.
+        let part_b = reqwest::multipart::Part::bytes(vec![1u8; 8])
+            .file_name("photo.jpg")
+            .mime_str("image/jpeg")
+            .unwrap();
+        let form2 = reqwest::multipart::Form::new().part("file", part_b);
+        let resp2 = reqwest::Client::new()
+            .post(&upload_url)
+            .multipart(form2)
+            .send()
+            .await
+            .expect("upload POST 2");
+        assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+        let json2: serde_json::Value = resp2.json().await.unwrap();
+        assert_eq!(json2["files"][0]["path"], "uploads/photo_1.jpg");
+        assert!(td.path().join("uploads").join("photo_1.jpg").exists());
+
         server_handle.abort();
     }
 }

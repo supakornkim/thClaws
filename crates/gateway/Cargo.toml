@@ -1,0 +1,64 @@
+[package]
+name = "thclaws-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "thClaws Gateway — provider proxy with SSO-minted access keys. Axum HTTP."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Standalone crate (no workspace `Cargo.toml` at thclaws/ root by
+# design — same pattern as thclaws-core / thclaws-line-server). Build
+# from this dir:
+#   cd thclaws/crates/gateway && cargo build --release
+# Image build (multi-stage Dockerfile) does the same from /build.
+
+[[bin]]
+name = "thclaws-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Axum HTTP. http1 only — LLM upstreams all accept h1 and dropping h2
+# trims the image. `multipart` for file passthrough (Anthropic
+# `multipart/form-data` paths), `json` for `/v1/keys` bodies.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "macros", "query"] }
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+futures = "0.3"
+http = "1"
+http-body-util = "0.1"
+
+# Config + observability
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto / SSO id_token verify
+sha2 = "0.10"
+base64 = "0.22"
+jsonwebtoken = "9"
+uuid = { version = "1", features = ["v4", "serde"] }
+getrandom = "0.2"
+
+# Outbound HTTP to upstream providers + JWKS fetch
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Postgres-backed key table. Stub mode (in-memory) lets dev / unit
+# tests run without a live DB. `runtime-tokio-rustls` shares the
+# rustls stack with reqwest.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate", "chrono", "uuid"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+# Misc
+anyhow = "1"
+async-trait = "0.1"
+thiserror = "1"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+wiremock = "0.6"
+tower = { version = "0.5", features = ["util"] }

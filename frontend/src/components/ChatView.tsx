@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, Paperclip } from "lucide-react";
 import { send, subscribe } from "../hooks/useIPC";
 import { useTheme } from "../hooks/useTheme";
 import { useVersion } from "../hooks/useVersion";
@@ -83,6 +83,11 @@ type AskPrompt = {
 
 const SUPPORTED_IMAGE_MIME = /^image\/(png|jpeg|jpg|webp|gif)$/;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB per attachment
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB per uploaded file (--serve / webapp upload)
+const MAX_UPLOAD_FILES = 5;
+
+const HAS_WRY_TRANSPORT =
+  typeof window !== "undefined" && typeof window.ipc !== "undefined";
 
 /// Pull the base64 portion out of a `data:<mime>;base64,<b64>` URL.
 /// FileReader.readAsDataURL hands us the prefixed form; the backend
@@ -142,6 +147,8 @@ export function ChatView({ active, modalOpen }: Props) {
   const [waitingFirstByte, setWaitingFirstByte] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
   const copiedTimerRef = useRef<number | null>(null);
   const errorTimerRef = useRef<number | null>(null);
   const waitingTimerRef = useRef<number | null>(null);
@@ -255,6 +262,45 @@ export function ChatView({ active, modalOpen }: Props) {
 
   const removeAttachment = (id: string) => {
     setAttachments((prev) => prev.filter((a) => a.id !== id));
+  };
+
+  const onUploadButtonClick = () => {
+    if (uploading || streaming) return;
+    fileInputRef.current?.click();
+  };
+
+  const onUploadFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const list = e.target.files;
+    if (!list || list.length === 0) return;
+    if (list.length > MAX_UPLOAD_FILES) {
+      showAttachmentError(`Max ${MAX_UPLOAD_FILES} files per upload`);
+      e.target.value = "";
+      return;
+    }
+    const form = new FormData();
+    for (const f of Array.from(list)) {
+      if (f.size > MAX_UPLOAD_BYTES) {
+        showAttachmentError(
+          `${f.name} is ${(f.size / 1024 / 1024).toFixed(1)} MB (max ${MAX_UPLOAD_BYTES / 1024 / 1024} MB)`,
+        );
+        e.target.value = "";
+        return;
+      }
+      form.append("file", f, f.name);
+    }
+    setUploading(true);
+    try {
+      const resp = await fetch("/upload", { method: "POST", body: form });
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => "");
+        showAttachmentError(`Upload failed (${resp.status}) ${detail}`);
+      }
+    } catch (err) {
+      showAttachmentError(`Upload failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
   };
 
   useEffect(() => {
@@ -1227,6 +1273,34 @@ export function ChatView({ active, modalOpen }: Props) {
           </div>
         )}
         <div className="flex gap-2 items-end">
+          {!HAS_WRY_TRANSPORT && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                onChange={onUploadFilesSelected}
+                style={{ display: "none" }}
+              />
+              <button
+                type="button"
+                onClick={onUploadButtonClick}
+                disabled={uploading || streaming}
+                aria-label="Upload files"
+                title={`Upload up to ${MAX_UPLOAD_FILES} files (max ${MAX_UPLOAD_BYTES / 1024 / 1024} MB each) to ./uploads/`}
+                className="px-2 py-2 rounded text-sm transition-colors inline-flex items-center justify-center"
+                style={{
+                  background: "var(--bg-tertiary)",
+                  color: uploading ? "var(--text-secondary)" : "var(--text-primary)",
+                  border: "1px solid var(--border)",
+                  cursor: uploading || streaming ? "not-allowed" : "pointer",
+                  minHeight: "36px",
+                }}
+              >
+                <Paperclip size={16} />
+              </button>
+            </>
+          )}
           <textarea
             ref={inputRef}
             value={input}

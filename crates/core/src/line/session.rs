@@ -93,10 +93,12 @@ impl LineSession {
     /// Drive the WS loop forever. Returns only on cancellation or
     /// a permanent error (rare — reconnect handles transient).
     pub async fn run(self: Arc<Self>) -> Result<(), LineClientError> {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let sink = SessionSink {
             client: self.client.clone(),
             handler: self.handler.clone(),
             approver: self.approver.clone(),
+            workspace: Arc::new(workspace),
         };
         self.client.run(sink).await
     }
@@ -106,6 +108,7 @@ struct SessionSink {
     client: Arc<LineClient>,
     handler: Arc<dyn LineMessageHandler>,
     approver: Option<Arc<LineApprover>>,
+    workspace: Arc<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -205,6 +208,45 @@ impl LineEnvelopeSink for SessionSink {
                 // Surface as a regular eprintln — Phase 1.3 GUI
                 // will also drop a side-bubble on Notice.
                 eprintln!("[line] notice: {text}");
+            }
+            WsEnvelope::Upload {
+                filename,
+                content_b64,
+                media_type,
+                size_bytes,
+                request_id,
+            } => {
+                eprintln!(
+                    "[line] upload: {} ({} bytes, media_type={:?})",
+                    filename, size_bytes, media_type
+                );
+                let saved = match crate::line::save_upload(
+                    &self.workspace,
+                    &filename,
+                    &content_b64,
+                    size_bytes,
+                    media_type,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[line] upload save failed: {e}");
+                        return;
+                    }
+                };
+                let synth = crate::uploads::render_upload_message("line", &[saved]);
+                let handler = self.handler.clone();
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    if let Some(reply) = handler.handle_message(synth).await {
+                        let body = filter_for_line(&reply);
+                        if let Err(e) = client.send_reply(&request_id, body).await {
+                            eprintln!(
+                                "[line] upload reply failed (request_id={}): {}",
+                                request_id, e
+                            );
+                        }
+                    }
+                });
             }
         }
     }

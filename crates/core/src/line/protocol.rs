@@ -32,6 +32,20 @@ pub enum WsEnvelope {
     /// shown verbatim in the local thClaws log; not forwarded
     /// to the agent.
     Notice { text: String },
+    /// File uploaded from the browser-chat surface via the relay's
+    /// `POST /chat/upload`. Bytes are base64 over the broker
+    /// channel because the WS frame is text. The desktop decodes,
+    /// writes to `<workspace>/uploads/<unique>`, and feeds a
+    /// synthesized chat message into the session — project
+    /// AGENTS.md / CLAUDE.md instructions steer behavior.
+    Upload {
+        filename: String,
+        content_b64: String,
+        #[serde(default)]
+        media_type: Option<String>,
+        size_bytes: u64,
+        request_id: String,
+    },
 }
 
 /// Container that lets us tag the WS frame variant we received
@@ -168,6 +182,49 @@ mod tests {
         match env {
             WsEnvelope::UserMessage { line_msg_id, .. } => assert!(line_msg_id.is_empty()),
             _ => panic!("expected UserMessage"),
+        }
+    }
+
+    #[test]
+    fn upload_decodes_from_relay_shape() {
+        // Mirror of the JSON `line-server`'s
+        // `broker::WsEnvelope::Upload` serializes (snake_case tag,
+        // `kind` discriminator). Cross-crate wire compatibility is
+        // pinned here — any rename on either side fails this test.
+        let json = r#"{
+            "kind": "upload",
+            "filename": "photo.jpg",
+            "content_b64": "AQIDBAU=",
+            "media_type": "image/jpeg",
+            "size_bytes": 5,
+            "request_id": "req-1"
+        }"#;
+        let env: WsEnvelope = serde_json::from_str(json).unwrap();
+        match env {
+            WsEnvelope::Upload {
+                filename,
+                content_b64,
+                media_type,
+                size_bytes,
+                request_id,
+            } => {
+                assert_eq!(filename, "photo.jpg");
+                assert_eq!(content_b64, "AQIDBAU=");
+                assert_eq!(media_type.as_deref(), Some("image/jpeg"));
+                assert_eq!(size_bytes, 5);
+                assert_eq!(request_id, "req-1");
+            }
+            _ => panic!("expected Upload"),
+        }
+    }
+
+    #[test]
+    fn upload_tolerates_missing_media_type() {
+        let json = r#"{"kind":"upload","filename":"a.bin","content_b64":"AQ==","size_bytes":1,"request_id":"r"}"#;
+        let env: WsEnvelope = serde_json::from_str(json).unwrap();
+        match env {
+            WsEnvelope::Upload { media_type, .. } => assert!(media_type.is_none()),
+            _ => panic!("expected Upload"),
         }
     }
 }

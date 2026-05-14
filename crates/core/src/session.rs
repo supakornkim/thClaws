@@ -34,11 +34,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// + dropped corrupt line" — but corrupt lines are still corrupt
 /// data. Locking eliminates the interleave entirely. Acquire
 /// exclusive lock before each write; release at scope end via Drop.
+///
+/// ## Issue #90: Windows `os error 5` on lock acquisition
+///
+/// The open call MUST include `.read(true)`. On Windows, `append(true)`
+/// alone produces a handle with the access mask
+/// `FILE_GENERIC_WRITE & !FILE_WRITE_DATA` — i.e. `FILE_APPEND_DATA +
+/// FILE_WRITE_ATTRIBUTES + ...`, no `GENERIC_READ`. The Win32
+/// `LockFileEx` API the `fs2` crate calls under the hood requires the
+/// file handle to have `GENERIC_READ` or `GENERIC_WRITE` access; an
+/// append-only handle fails the access check and returns
+/// `ERROR_ACCESS_DENIED` (os error 5). Symptom on Windows: every
+/// session save fails with `save failed: config error: session lock:
+/// Access is denied. (os error 5)`, JSONL files end up zero bytes,
+/// session restore shows empty history. POSIX `flock` doesn't have
+/// this requirement, so macOS / Linux work fine with append-only.
+/// Adding `.read(true)` fixes Windows without any behavior change on
+/// POSIX. See <https://github.com/thClaws/thClaws/issues/90>.
 fn append_locked<F>(path: &Path, write: F) -> Result<()>
 where
     F: FnOnce(&mut File) -> std::io::Result<()>,
 {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
     // `lock_exclusive` blocks until acquired. Cheap on uncontested
     // path (single process). On contention, waits for the other
     // process's append to complete.
@@ -1255,6 +1276,30 @@ mod tests {
     use super::*;
     use crate::types::{ContentBlock, Role};
     use tempfile::tempdir;
+
+    /// Issue #90 regression: pre-fix, `append_locked` opened the
+    /// JSONL with `.create(true).append(true)` only. On Windows that
+    /// hands `LockFileEx` a handle without `GENERIC_READ`, the
+    /// API returns `ERROR_ACCESS_DENIED` (os error 5), and every
+    /// session save fails. POSIX `flock` doesn't have that
+    /// requirement, so macOS / Linux passed even with the old code
+    /// — but the test still pins the contract: two back-to-back
+    /// calls succeed AND both writes land in the file. If
+    /// `append_locked` ever drops `.read(true)` again, this test
+    /// keeps passing on POSIX but the Windows CI job (or any
+    /// Windows user) breaks on first save. The body is the same
+    /// shape on every OS so the test is cross-platform.
+    #[test]
+    fn append_locked_acquires_and_releases_for_repeat_writes() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("session.jsonl");
+
+        append_locked(&path, |f| f.write_all(b"line-1\n")).expect("first append");
+        append_locked(&path, |f| f.write_all(b"line-2\n")).expect("second append");
+
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(body, "line-1\nline-2\n");
+    }
 
     fn sample_messages() -> Vec<Message> {
         vec![

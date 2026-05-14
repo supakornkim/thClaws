@@ -72,6 +72,54 @@ fn main() {
         .unwrap_or_default();
     println!("cargo:rustc-env=THCLAWS_EMBEDDED_POLICY_PUBKEY={embedded_b64}");
 
+    // ── Bundled SSO credentials ──────────────────────────────────────
+    //
+    // Official release builds bake in the OAuth client IDs so the
+    // navbar "Sign in with …" buttons work out of the box without
+    // forcing every user to populate `.env` first. Three values,
+    // resolved at build time in this order — first non-empty wins:
+    //
+    //   1. Build-time env var (`BUNDLED_GOOGLE_CLIENT_ID`,
+    //      `BUNDLED_GOOGLE_CLIENT_SECRET`, `BUNDLED_AZURE_CLIENT_ID`).
+    //      CI release workflows use this; one-liner builds can too:
+    //        BUNDLED_AZURE_CLIENT_ID=... cargo build --features gui
+    //   2. `~/.config/thclaws/bundled-sso.env` — persistent local
+    //      override so dev rebuilds don't need to re-export each
+    //      time. Same KEY=VALUE shape as a `.env`. Gitignored by
+    //      convention (lives outside the repo). See
+    //      `parse_bundled_sso_file` below.
+    //   3. Empty default — runtime `sso::builtin::is_configured`
+    //      falls back to checking `std::env::var(...)` (the
+    //      published `.env` flow). No bundle, no behavior change.
+    //
+    // Safety: client IDs are public per Microsoft + Google docs;
+    // bundling them adds no information an attacker doesn't already
+    // see in OAuth URLs. Google's CLIENT_SECRET is also "public" in
+    // the OAuth sense — what makes bundling safe is the gateway's
+    // signature + `aud` check (see thclaws-technical-manual/sso.md).
+    // Azure native/public clients run PKCE and don't have a secret,
+    // so no `BUNDLED_AZURE_CLIENT_SECRET` exists.
+    println!("cargo:rerun-if-env-changed=BUNDLED_GOOGLE_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=BUNDLED_GOOGLE_CLIENT_SECRET");
+    println!("cargo:rerun-if-env-changed=BUNDLED_AZURE_CLIENT_ID");
+    let bundled_file = bundled_sso_file_path();
+    if let Some(path) = bundled_file.as_ref() {
+        // Re-run when the file is created / modified. Cargo
+        // tolerates a non-existent path here — the directive simply
+        // never fires until the file appears.
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    let from_file = bundled_file
+        .as_deref()
+        .and_then(parse_bundled_sso_file)
+        .unwrap_or_default();
+    let google_id = resolve_bundled("BUNDLED_GOOGLE_CLIENT_ID", &from_file);
+    let google_secret = resolve_bundled("BUNDLED_GOOGLE_CLIENT_SECRET", &from_file);
+    let azure_id = resolve_bundled("BUNDLED_AZURE_CLIENT_ID", &from_file);
+    println!("cargo:rustc-env=BUNDLED_GOOGLE_CLIENT_ID={google_id}");
+    println!("cargo:rustc-env=BUNDLED_GOOGLE_CLIENT_SECRET={google_secret}");
+    println!("cargo:rustc-env=BUNDLED_AZURE_CLIENT_ID={azure_id}");
+
     embed_windows_icon();
 }
 
@@ -191,6 +239,66 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+/// Resolution helper: env var wins, then file value, then empty.
+/// Empty / whitespace-only values are treated as unset on every layer.
+fn resolve_bundled(name: &str, from_file: &std::collections::HashMap<String, String>) -> String {
+    if let Ok(v) = std::env::var(name) {
+        let trimmed = v.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    from_file
+        .get(name)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+/// `~/.config/thclaws/bundled-sso.env` (or `%APPDATA%\thclaws\…` on
+/// Windows). Returns `None` only when no home directory is
+/// resolvable (rare/broken env).
+fn bundled_sso_file_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())?;
+    Some(std::path::PathBuf::from(home).join(".config/thclaws/bundled-sso.env"))
+}
+
+/// Tiny KEY=VALUE parser — no deps, no `.env`-style escaping
+/// gymnastics. Skips blank lines + `#` comments. Strips surrounding
+/// quotes on the value side so `BUNDLED_AZURE_CLIENT_ID="abc"` and
+/// `BUNDLED_AZURE_CLIENT_ID=abc` both work. Anything malformed is
+/// silently skipped — build scripts shouldn't panic over a typo in
+/// a config file.
+fn parse_bundled_sso_file(
+    path: &std::path::Path,
+) -> Option<std::collections::HashMap<String, String>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut out = std::collections::HashMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        if key.is_empty() {
+            continue;
+        }
+        out.insert(key, value.to_string());
+    }
+    Some(out)
 }
 
 fn git(args: &[&str]) -> Option<String> {

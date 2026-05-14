@@ -1172,6 +1172,53 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 .send(crate::shared_session::ShellInput::ReloadConfig);
         }
 
+        // ── thClaws Gateway settings ────────────────────────────────
+        // Per-provider routing list lives in settings.json alongside
+        // openrouterFreeOnly. The gateway access key is stored in the
+        // OS keychain via the existing api_key_set pipeline (provider
+        // name = "gateway"). The base URL is fixed at
+        // `providers::thclaws_gateway::GATEWAY_BASE_URL` and never
+        // user-configurable from the UI.
+        "gateway_settings_get" => {
+            let cfg = crate::config::AppConfig::load().unwrap_or_default();
+            let payload = serde_json::json!({
+                "type": "gateway_settings",
+                "base_url": crate::providers::thclaws_gateway::GATEWAY_BASE_URL,
+                "use_for": cfg.gateway_use_for,
+            });
+            (ctx.dispatch)(payload.to_string());
+        }
+        "gateway_settings_set" => {
+            let use_for: Vec<String> = msg
+                .get("use_for")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.trim().to_lowercase()))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut cfg = crate::config::ProjectConfig::load().unwrap_or_default();
+            cfg.set_gateway_use_for(use_for.clone());
+            let (ok, error) = match cfg.save() {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, e.to_string()),
+            };
+            let payload = serde_json::json!({
+                "type": "gateway_settings_result",
+                "base_url": crate::providers::thclaws_gateway::GATEWAY_BASE_URL,
+                "use_for": use_for,
+                "ok": ok,
+                "error": error,
+            });
+            (ctx.dispatch)(payload.to_string());
+            let _ = ctx
+                .shared
+                .input_tx
+                .send(crate::shared_session::ShellInput::ReloadConfig);
+        }
+
         // ── KMS sidebar mutators (M6.36 SERVE9f) ───────────────────
         "kms_toggle" => {
             let name = msg
@@ -1321,23 +1368,12 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     let runtime_loaded =
                         matches!(provider, "ollama" | "ollama-anthropic" | "lmstudio");
                     if models.len() >= 3 && !runtime_loaded {
-                        let kind = crate::providers::ProviderKind::detect(&new_cfg.model);
+                        let _ = crate::providers::ProviderKind::detect(&new_cfg.model);
                         let model_rows: Vec<serde_json::Value> = models
                             .iter()
                             .map(|(id, e)| {
-                                // Canonicalize so the model_set IPC
-                                // receives an id that ProviderKind::detect
-                                // can route (catalogue stores OpenRouter
-                                // ids without the `openrouter/` prefix).
-                                let canonical = match kind {
-                                    Some(k)
-                                        if crate::providers::ProviderKind::detect(id)
-                                            != Some(k) =>
-                                    {
-                                        format!("{provider}/{id}")
-                                    }
-                                    _ => id.clone(),
-                                };
+                                let canonical =
+                                    crate::model_catalogue::canonical_model_id(provider, id);
                                 serde_json::json!({
                                     "id": canonical,
                                     "context": e.context,

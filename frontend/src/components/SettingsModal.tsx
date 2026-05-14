@@ -48,6 +48,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   ollama: "Ollama",
   "ollama-anthropic": "Ollama (Anthropic-compatible)",
   "ollama-cloud": "Ollama Cloud",
+  "opencode-go": "OpenCode Go",
   azure: "Azure AI Foundry",
   "openai-compat": "OpenAI-Compatible (custom endpoint)",
   tavily: "Tavily Search",
@@ -281,6 +282,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </p>
 
         <div className="flex flex-col gap-3">
+          <GatewaySettingsSection />
+
           {llmEntries.map(([provider, row]) =>
             renderProviderCard(
               provider,
@@ -388,9 +391,14 @@ function renderProviderCard(
       )}
 
       {provider === "openrouter" && <OpenRouterFreeOnlyToggle />}
+      {GATEWAY_PROVIDERS.has(provider) && <GatewayPerProviderToggle provider={provider} />}
     </div>
   );
 }
+
+/// Provider names that have an upstream route on the thClaws Gateway.
+/// Must match `crate::providers::thclaws_gateway::provider_segment`.
+const GATEWAY_PROVIDERS = new Set(["openai", "anthropic", "gemini", "openrouter"]);
 
 /// OpenRouter-only inline toggle. When on, both the model picker
 /// and the `/models` slash command hide non-free rows. Persisted
@@ -416,6 +424,165 @@ function OpenRouterFreeOnlyToggle() {
         }}
       />
       <span>Free only — filter the model picker and /models to $0 / $0 pricing</span>
+    </label>
+  );
+}
+
+/// Frontend provider id → gateway path segment. Must mirror
+/// `crate::providers::thclaws_gateway::provider_segment`.
+const PROVIDER_TO_GATEWAY_SEGMENT: Record<string, string> = {
+  openai: "openai",
+  anthropic: "anthropic",
+  gemini: "google",
+  openrouter: "openrouter",
+};
+
+type GatewaySettings = {
+  base_url: string;
+  use_for: string[];
+};
+
+let cachedGatewaySettings: GatewaySettings | null = null;
+const gatewayListeners = new Set<(s: GatewaySettings) => void>();
+
+function applyGatewaySettings(s: GatewaySettings) {
+  cachedGatewaySettings = s;
+  for (const cb of gatewayListeners) cb(s);
+}
+
+function ensureGatewaySubscription() {
+  if ((ensureGatewaySubscription as { inited?: boolean }).inited) return;
+  (ensureGatewaySubscription as { inited?: boolean }).inited = true;
+  subscribe((msg) => {
+    if (msg.type === "gateway_settings" || msg.type === "gateway_settings_result") {
+      const settings = {
+        base_url: String((msg as { base_url?: string }).base_url ?? ""),
+        use_for: ((msg as { use_for?: string[] }).use_for ?? []).map((s) => String(s)),
+      };
+      applyGatewaySettings(settings);
+    }
+  });
+  send({ type: "gateway_settings_get" });
+}
+
+function useGatewaySettings(): GatewaySettings {
+  const [state, setState] = useState<GatewaySettings>(
+    () => cachedGatewaySettings ?? { base_url: "", use_for: [] },
+  );
+  useEffect(() => {
+    ensureGatewaySubscription();
+    gatewayListeners.add(setState);
+    if (cachedGatewaySettings) setState(cachedGatewaySettings);
+    return () => {
+      gatewayListeners.delete(setState);
+    };
+  }, []);
+  return state;
+}
+
+function persistGatewaySettings(use_for: string[]) {
+  // Base URL is fixed on the backend; the IPC echoes it back in
+  // gateway_settings_result so we always render the current value.
+  const current = cachedGatewaySettings?.base_url ?? "";
+  applyGatewaySettings({ base_url: current, use_for });
+  send({ type: "gateway_settings_set", use_for });
+}
+
+/// Top-of-modal card: access key field for the fixed thClaws Gateway.
+/// Access key persists to the keychain via the existing api_key_set
+/// IPC (provider name "gateway"). The gateway base URL is hard-coded
+/// on the backend (see `providers::thclaws_gateway::GATEWAY_BASE_URL`)
+/// — users only paste their key and flip the per-provider toggles.
+function GatewaySettingsSection() {
+  const settings = useGatewaySettings();
+  const [keyDraft, setKeyDraft] = useState("");
+  const onSaveKey = () => {
+    const trimmed = keyDraft.trim();
+    if (!trimmed) return;
+    send({ type: "api_key_set", provider: "gateway", key: trimmed });
+    setKeyDraft("");
+  };
+  return (
+    <div
+      className="rounded-lg p-3"
+      style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <LinkIcon size={12} style={{ color: "var(--accent)" }} />
+        <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          thClaws Gateway
+        </span>
+      </div>
+      <p className="text-xs mb-2" style={{ color: "var(--text-secondary)" }}>
+        Route per-provider traffic through <span className="font-mono">{settings.base_url}</span>.
+        Paste your access key here, then flip "Use thClaws Gateway" on the provider cards below.
+      </p>
+      <FieldLabel icon={<KeyRound size={11} />} text="Access key" env="THCLAWS_GATEWAY_API_KEY" />
+      <div className="flex gap-1.5">
+        <input
+          type="password"
+          placeholder="Paste gateway access key (gw_v1_…)"
+          className="flex-1 px-2.5 py-1.5 rounded text-xs font-mono outline-none"
+          style={{
+            background: "var(--bg-primary)",
+            color: "var(--text-primary)",
+            border: "1px solid var(--border)",
+          }}
+          value={keyDraft}
+          onChange={(e) => setKeyDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onSaveKey();
+          }}
+          autoComplete="off"
+        />
+        <button
+          type="button"
+          onClick={onSaveKey}
+          disabled={!keyDraft.trim()}
+          className="px-2 py-1.5 rounded text-xs"
+          style={{
+            background: keyDraft.trim() ? "var(--accent)" : "var(--bg-primary)",
+            color: keyDraft.trim() ? "var(--accent-fg)" : "var(--text-secondary)",
+            border: "1px solid var(--border)",
+            cursor: keyDraft.trim() ? "pointer" : "not-allowed",
+          }}
+        >
+          Save
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/// Per-provider "Use thClaws Gateway" checkbox in the provider card.
+/// Always enabled — gateway routing kicks in once the user has also
+/// pasted the access key (overlay returns None and falls back to the
+/// upstream when the key is missing, so toggling without a key is a
+/// no-op rather than an error).
+function GatewayPerProviderToggle({ provider }: { provider: string }) {
+  const settings = useGatewaySettings();
+  const segment = PROVIDER_TO_GATEWAY_SEGMENT[provider];
+  const on = !!segment && settings.use_for.includes(segment);
+  const onChange = (checked: boolean) => {
+    if (!segment) return;
+    const next = new Set(settings.use_for);
+    if (checked) next.add(segment);
+    else next.delete(segment);
+    persistGatewaySettings(Array.from(next));
+  };
+  return (
+    <label
+      className="flex items-center gap-2 mt-2 text-xs select-none cursor-pointer"
+      style={{ color: "var(--text-secondary)" }}
+      title={`Route ${provider} traffic through the thClaws Gateway.`}
+    >
+      <input
+        type="checkbox"
+        checked={on}
+        disabled={!segment}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span>Use thClaws Gateway</span>
     </label>
   );
 }

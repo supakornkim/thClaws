@@ -29,6 +29,7 @@
 
 use super::{EventStream, ModelInfo, Provider, ProviderEvent, StreamRequest};
 use crate::error::{Error, Result};
+use crate::tools::ToolRegistry;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -43,6 +44,10 @@ pub struct AgentSdkProvider {
     session_id: Arc<Mutex<Option<String>>>,
     /// Monotonic request id counter for control_request messages.
     next_req: Arc<Mutex<u64>>,
+    /// Tools to expose to the subprocess via the in-process SDK MCP
+    /// server (`crate::sdk_mcp`). `None` → no bridge: built-ins stay
+    /// enabled and the subprocess can't see thClaws's tools.
+    tools: Option<Arc<ToolRegistry>>,
 }
 
 impl AgentSdkProvider {
@@ -52,12 +57,37 @@ impl AgentSdkProvider {
             claude_bin: bin,
             session_id: Arc::new(Mutex::new(None)),
             next_req: Arc::new(Mutex::new(0)),
+            tools: None,
         }
     }
 
     pub fn with_bin(mut self, bin: impl Into<String>) -> Self {
         self.claude_bin = bin.into();
         self
+    }
+
+    /// Wire up the SDK MCP bridge: Claude Code's built-in tools are
+    /// disabled, thClaws's tools are exposed via in-process MCP.
+    pub fn with_tools(mut self, tools: Arc<ToolRegistry>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Default bridge registry: every always-on tool registered in
+    /// the standard built-in set plus the KMS + Memory + Todo
+    /// surfaces. Excluded-from-bridge tools (Task, Team*, AskUser,
+    /// plan-mode tools) are filtered at `sdk_mcp::handle_mcp_message`
+    /// time. Used by `build_provider` so the bridge stands up
+    /// without the caller threading their own registry.
+    pub fn with_default_thclaws_tools() -> Arc<ToolRegistry> {
+        let mut r = ToolRegistry::with_builtins();
+        r.register(Arc::new(crate::tools::KmsReadTool));
+        r.register(Arc::new(crate::tools::KmsSearchTool));
+        r.register(Arc::new(crate::tools::KmsWriteTool));
+        r.register(Arc::new(crate::tools::KmsAppendTool));
+        r.register(Arc::new(crate::tools::KmsDeleteTool));
+        r.register(Arc::new(crate::tools::KmsCreateTool));
+        Arc::new(r)
     }
 
     fn next_request_id(&self) -> String {
@@ -128,6 +158,20 @@ impl Provider for AgentSdkProvider {
             if let Some(ref sid) = *guard {
                 cmd.arg("--resume").arg(sid);
             }
+        }
+
+        // SDK MCP bridge. When a tool registry is attached, expose
+        // thClaws's tools to the subprocess and pin the allowedTools
+        // filter to ONLY those bridged names — Claude Code's
+        // built-in tools (Read/Edit/Bash/etc) are disabled so the
+        // model can't bypass thClaws's sandbox + hooks by using
+        // them. Without the registry, this whole block is skipped
+        // and Claude Code runs with its native tools.
+        if let Some(tools) = &self.tools {
+            let mcp_config = crate::sdk_mcp::mcp_config_value();
+            cmd.arg("--mcp-config").arg(mcp_config.to_string());
+            let patterns = crate::sdk_mcp::allowed_tool_patterns(tools);
+            cmd.arg("--allowedTools").arg(patterns.join(","));
         }
 
         // Mirror the Python SDK env hygiene: identify ourselves via
@@ -244,19 +288,30 @@ impl Provider for AgentSdkProvider {
             .await
             .map_err(|e| Error::Provider(format!("write user message: {e}")))?;
 
-        // No bidirectional hooks / SDK MCP servers on our end, so closing
-        // stdin now signals EOF and lets the CLI commit the session file
-        // cleanly once the turn finishes.
-        drop(stdin);
+        // Keep stdin open when the SDK MCP bridge is wired up: Claude
+        // Code sends `control_request { subtype: "mcp_message" }`
+        // back to us for every `tools/list` and `tools/call`. Drop
+        // stdin only when no bridge is configured — preserves the
+        // pre-bridge behavior of letting the CLI commit the session
+        // file on EOF.
+        let stdin_for_stream = if self.tools.is_some() {
+            Some(stdin)
+        } else {
+            drop(stdin);
+            None
+        };
 
         // ── 4. Stream stdout until `result` ──────────────────────────────
         let session_for_stream = self.session_id.clone();
+        let tools_for_stream = self.tools.clone();
         let raw_dump = super::RawDump::new(format!("agent-sdk {}", req.model));
         let event_stream = try_stream! {
             // Hold the child handle so the subprocess is reaped when the
             // stream is dropped.
             let _child = child;
             let mut reader: BufReader<ChildStdout> = reader;
+            let mut stdin_handle = stdin_for_stream;
+            let bridge_tools = tools_for_stream;
             let mut line_buf = String::new();
             let mut seen_start = false;
             let mut first_text_yielded = false;
@@ -325,12 +380,44 @@ impl Provider for AgentSdkProvider {
                     // as it runs tools server-side. We ignore them; the model
                     // already has them server-side.
                     "user" => {}
-                    // Any inbound control_request means claude is asking us
-                    // something (permission, hook callback). With
-                    // --permission-mode bypassPermissions we shouldn't get
-                    // permission prompts, but acknowledge other subtypes as
-                    // no-ops so we don't hang.
-                    "control_request" => {}
+                    // Inbound control_request from claude. With
+                    // --permission-mode bypassPermissions we don't get
+                    // permission prompts, but the SDK MCP bridge sends
+                    // `mcp_message` requests here whenever the model
+                    // calls a bridged tool — we dispatch via
+                    // crate::sdk_mcp and write a control_response back
+                    // through stdin.
+                    "control_request" => {
+                        let req_id = v.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
+                        let subtype = v.pointer("/request/subtype").and_then(Value::as_str).unwrap_or("");
+                        if subtype == "mcp_message" {
+                            let server_name = v.pointer("/request/server_name").and_then(Value::as_str).unwrap_or("");
+                            if server_name == crate::sdk_mcp::SERVER_NAME {
+                                let mcp_msg = v.pointer("/request/message").cloned().unwrap_or(Value::Null);
+                                let mcp_resp = match &bridge_tools {
+                                    Some(reg) => crate::sdk_mcp::handle_mcp_message(reg.clone(), &mcp_msg).await,
+                                    None => json!({
+                                        "jsonrpc":"2.0",
+                                        "id": mcp_msg.get("id").cloned().unwrap_or(Value::Null),
+                                        "error": { "code": -32601, "message": "no tools registry attached" },
+                                    }),
+                                };
+                                let envelope = json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "success",
+                                        "request_id": req_id,
+                                        "response": { "mcp_response": mcp_resp },
+                                    },
+                                });
+                                if let Some(stdin) = stdin_handle.as_mut() {
+                                    let _ = stdin.write_all(envelope.to_string().as_bytes()).await;
+                                    let _ = stdin.write_all(b"\n").await;
+                                    let _ = stdin.flush().await;
+                                }
+                            }
+                        }
+                    }
                     "control_response" => {}
                     // Terminal frame: the turn is done.
                     "result" => {

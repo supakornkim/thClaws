@@ -57,6 +57,7 @@ pub mod research;
 pub mod sandbox;
 pub mod schedule;
 pub mod schedule_presets;
+pub mod sdk_mcp;
 pub mod secrets;
 #[cfg(feature = "gui")]
 pub mod server;
@@ -77,6 +78,7 @@ pub mod theme;
 pub mod tokens;
 pub mod tools;
 pub mod types;
+pub mod uploads;
 pub mod usage;
 pub mod util;
 pub mod version;

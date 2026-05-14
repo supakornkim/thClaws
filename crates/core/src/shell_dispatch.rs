@@ -418,16 +418,11 @@ pub async fn dispatch(
             );
             for (id, entry) in &rows {
                 // Print the canonical (routable) id so users can copy a
-                // row verbatim into `/model <id>`. The catalogue stores
-                // OpenRouter / Nvidia / DashScope etc. with bare ids
-                // (e.g. `google/gemma-3-27b-it:free`) but those don't
-                // route through `ProviderKind::detect` without their
-                // provider prefix — pre-fix users hit "unknown model
-                // provider" when copying a row from /models output.
-                let canonical = match crate::providers::ProviderKind::detect(id) {
-                    Some(k) if k.name() == provider_name => id.clone(),
-                    _ => format!("{provider_name}/{id}"),
-                };
+                // row verbatim into `/model <id>`. See
+                // `model_catalogue::canonical_model_id` for the rules
+                // (handles already-prefixed catalogue ids and
+                // bare-routable provider ids without double-prefixing).
+                let canonical = crate::model_catalogue::canonical_model_id(provider_name, id);
                 let ctx = entry
                     .context
                     .map(format_tokens)
@@ -466,24 +461,12 @@ pub async fn dispatch(
                         models.retain(|(_, e)| e.free == Some(true));
                     }
                     if models.len() >= 3 {
-                        let kind = crate::providers::ProviderKind::detect(&state.config.model);
+                        let _ = crate::providers::ProviderKind::detect(&state.config.model);
                         let model_rows: Vec<serde_json::Value> = models
                             .iter()
                             .map(|(id, e)| {
-                                // Catalogue stores OpenRouter ids without the
-                                // `openrouter/` prefix; ProviderKind::detect
-                                // needs it to route, so canonicalize before
-                                // shipping. React strips the prefix for
-                                // display (see ModelPickerModal).
-                                let canonical = match kind {
-                                    Some(k)
-                                        if crate::providers::ProviderKind::detect(id)
-                                            != Some(k) =>
-                                    {
-                                        format!("{prov}/{id}")
-                                    }
-                                    _ => id.clone(),
-                                };
+                                let canonical =
+                                    crate::model_catalogue::canonical_model_id(prov, id);
                                 serde_json::json!({
                                     "id": canonical,
                                     "context": e.context,

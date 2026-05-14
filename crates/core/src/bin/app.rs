@@ -317,6 +317,7 @@ async fn main() {
             };
             let serve_config = thclaws_core::server::ServeConfig {
                 bind: std::net::SocketAddr::new(bind_ip, cli.port),
+                ..Default::default()
             };
             if cli.gui {
                 if use_cli {

@@ -198,28 +198,43 @@ export function LoginButton() {
               )}
             </button>
           ) : providers.length === 0 ? (
-            // No env vars set — surface the configure hint inline so
-            // the user knows exactly what to do without trawling docs.
+            // No provider env vars set + no bundled credentials in the
+            // binary. Surface the configure hint inline so the user
+            // knows exactly what to do without trawling docs. Covers
+            // both standard providers — Google (id + secret) and
+            // Azure (id only; native/public client runs PKCE so no
+            // secret is required or accepted).
             <div
-              className="px-3 py-2 text-xs"
+              className="px-3 py-2 text-xs leading-relaxed"
               style={{ color: "var(--text-secondary)" }}
             >
-              Add{" "}
-              <code
-                className="font-mono"
-                style={{ color: "var(--text-primary)" }}
-              >
-                GOOGLE_CLIENT_ID
-              </code>{" "}
-              and{" "}
-              <code
-                className="font-mono"
-                style={{ color: "var(--text-primary)" }}
-              >
-                GOOGLE_CLIENT_SECRET
-              </code>{" "}
-              to your <code className="font-mono">.env</code> to enable
-              sign-in.
+              Add either of the following to your{" "}
+              <code className="font-mono">.env</code> to enable sign-in:
+              <ul className="mt-1.5 ml-3 list-disc">
+                <li>
+                  <code
+                    className="font-mono"
+                    style={{ color: "var(--text-primary)" }}
+                  >
+                    GOOGLE_CLIENT_ID
+                  </code>{" "}
+                  +{" "}
+                  <code
+                    className="font-mono"
+                    style={{ color: "var(--text-primary)" }}
+                  >
+                    GOOGLE_CLIENT_SECRET
+                  </code>
+                </li>
+                <li>
+                  <code
+                    className="font-mono"
+                    style={{ color: "var(--text-primary)" }}
+                  >
+                    AZURE_CLIENT_ID
+                  </code>
+                </li>
+              </ul>
             </div>
           ) : (
             providers.map((p) => (

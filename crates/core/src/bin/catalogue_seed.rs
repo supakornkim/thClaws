@@ -24,7 +24,7 @@
 //! Exit non-zero on any hard failure so CI can gate a refresh PR.
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -39,6 +39,7 @@ const DEEPSEEK_URL: &str = "https://api.deepseek.com/v1/models";
 const THAILLM_URL: &str = "http://thaillm.or.th/api/v1/models";
 const NVIDIA_URL: &str = "https://integrate.api.nvidia.com/v1/models";
 const MINIMAX_URL: &str = "https://api.minimax.io/v1/models";
+const OPENCODE_GO_URL: &str = "https://opencode.ai/zen/go/v1/models";
 // Alibaba DashScope. The compatible-mode endpoint is OpenAI-
 // shape so /v1/models returns {data:[{id, …}]}. We hit two
 // regions: the China-mainland default (`dashscope.aliyuncs.com`)
@@ -536,6 +537,51 @@ async fn run() -> Result<String, String> {
         report.push("  minimax:     skipped (no MINIMAX_API_KEY)".into());
     }
 
+    // 4e2. OpenCodeGo (opencode.ai). Subscription gateway serving
+    //      GLM / Kimi / DeepSeek / MiMo (OpenAI-compat path),
+    //      MiniMax M2.5 / M2.7 (Anthropic-compat path), and
+    //      Qwen3.5 / 3.6-plus (Alibaba-compat path) through one
+    //      base URL — `/v1/models` returns the full catalog as an
+    //      OpenAI envelope. Bare ids — the `opencode-go/` prefix
+    //      is added by the seed so ProviderKind::detect routes
+    //      correctly. Default context conservative at 128K; the
+    //      catalog mixes 200K (Kimi/MiniMax) and 1M (Qwen) windows
+    //      so per-row hand-bumps cover the long-context variants.
+    //      OPENCODE_GO_BASE_URL overrides for self-hosted proxies.
+    let opencode_go_url = std::env::var("OPENCODE_GO_BASE_URL")
+        .map(|b| format!("{}/models", b.trim_end_matches('/')))
+        .unwrap_or_else(|_| OPENCODE_GO_URL.to_string());
+    if let Ok(key) = std::env::var("OPENCODE_GO_API_KEY") {
+        match fetch_opencode_go(&opencode_go_url, &key).await {
+            Ok(ids) => {
+                let prefixed: Vec<String> = ids
+                    .into_iter()
+                    .map(|id| format!("opencode-go/{id}"))
+                    .collect();
+                let pc = cat
+                    .providers
+                    .entry("opencode-go".into())
+                    .or_insert_with(ProviderCatalogue::default);
+                if pc.default_context.is_none() {
+                    pc.default_context = Some(131072);
+                }
+                let added = merge_discovered(
+                    &mut cat,
+                    "opencode-go",
+                    &opencode_go_url,
+                    prefixed,
+                    &openrouter_ctx_by_bare,
+                    &openrouter_max_output_by_bare,
+                    &today,
+                );
+                push_provider_stats(&mut report, "opencode-go", &added, None);
+            }
+            Err(e) => report.push(format!("  opencode-go: FAILED ({e})")),
+        }
+    } else {
+        report.push("  opencode-go: skipped (no OPENCODE_GO_API_KEY)".into());
+    }
+
     // 4f. DashScope (Alibaba, mainland-China region). OpenAI-compat
     //     `/v1/models` at dashscope.aliyuncs.com lists the qwen-*
     //     family (qwen-max, qwen-plus, qwen3-coder-plus, etc.).
@@ -639,7 +685,7 @@ async fn run() -> Result<String, String> {
     if !claude_ids.is_empty() {
         let agent_pc = cat
             .providers
-            .entry("agent-sdk".into())
+            .entry("anthropic-agent".into())
             .or_insert_with(ProviderCatalogue::default);
         if agent_pc.default_context.is_none() {
             agent_pc.default_context = Some(200000);
@@ -666,7 +712,7 @@ async fn run() -> Result<String, String> {
         }
         push_provider_stats(
             &mut report,
-            "agent-sdk",
+            "anthropic-agent",
             &stats,
             Some("(derived from anthropic)"),
         );
@@ -751,7 +797,7 @@ fn merge_openrouter(cat: &mut Catalogue, rows: Vec<OpenRouterModel>, today: &str
         .or_insert_with(|| ProviderCatalogue {
             list_url: Some(OPENROUTER_URL.into()),
             default_context: Some(128_000),
-            models: HashMap::new(),
+            models: BTreeMap::new(),
         });
     let mut stats = MergeStats::default();
     for m in rows {
@@ -869,7 +915,7 @@ fn merge_gemini(cat: &mut Catalogue, rows: Vec<GeminiModel>, today: &str) -> Mer
         .or_insert_with(|| ProviderCatalogue {
             list_url: Some(GEMINI_URL.into()),
             default_context: Some(1_000_000),
-            models: HashMap::new(),
+            models: BTreeMap::new(),
         });
     let mut stats = MergeStats::default();
     for m in rows {
@@ -1088,6 +1134,36 @@ async fn fetch_minimax(key: &str) -> Result<Vec<String>, String> {
         .unwrap_or_default()
         .into_iter()
         .map(|m| m.id)
+        .collect())
+}
+
+/// OpenCodeGo (opencode.ai) — same OpenAI-compat envelope shape as
+/// Minimax / Ollama Cloud. Takes a `url` parameter so the seeder can
+/// honor `OPENCODE_GO_BASE_URL` for staging / self-hosted proxies
+/// without forking the function. Returns bare ids — caller adds the
+/// `opencode-go/` prefix at merge time. Some upstream responses already
+/// include the prefix on the id (`opencode-go/kimi-k2.6`); strip it
+/// here so the merge layer's prefix-prepend doesn't produce
+/// `opencode-go/opencode-go/...`.
+async fn fetch_opencode_go(url: &str, key: &str) -> Result<Vec<String>, String> {
+    let resp = client()?
+        .get(url)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("opencode-go HTTP {}", resp.status()));
+    }
+    let env: OpenAIEnvelope = resp.json().await.map_err(|e| format!("json: {e}"))?;
+    Ok(env
+        .data
+        .into_iter()
+        .map(|m| {
+            m.id.strip_prefix("opencode-go/")
+                .map(str::to_string)
+                .unwrap_or(m.id)
+        })
         .collect())
 }
 

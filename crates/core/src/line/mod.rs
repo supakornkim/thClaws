@@ -45,3 +45,7 @@ pub use config::{LineConfig, LineConfigError};
 pub use filter::{clean_for_stream, filter_for_line};
 pub use protocol::{WsEnvelope, WsIncoming};
 pub use session::LineSession;
+
+pub use upload::{save_upload, SaveUploadError};
+
+pub mod upload;

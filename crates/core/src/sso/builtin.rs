@@ -13,12 +13,31 @@
 //! `available()` so the UI doesn't dangle a button that errors on
 //! click.
 //!
-//! Why env vars rather than baking the client_id into the binary:
-//! Google + Azure desktop client_ids aren't confidential, but
-//! distributing them through `.env` lets each installation point at
-//! its own OAuth project (avoids one rate-limited shared app across
-//! the entire thClaws user base, and avoids forcing every fork to
-//! re-register).
+//! ## Where credentials come from
+//!
+//! Resolved in this order at runtime, first non-empty wins:
+//!
+//! 1. **`std::env::var`** — populated by the shell (`export …`) OR by
+//!    `crate::dotenv` loading `./.env` / `~/.config/thclaws/.env` at
+//!    startup. This is the local-dev / source-build path.
+//! 2. **Compile-time `BUNDLED_*` env vars** baked in by `build.rs`.
+//!    Official release builds inject these in CI (see
+//!    `.github/workflows/release.yml`) so the navbar "Sign in with
+//!    …" buttons work out of the box on the published dmg/msi.
+//!    Source builds without the CI env behave exactly like before
+//!    the bundling was added (the runtime read returns `Some("")`,
+//!    which the filter below drops).
+//!
+//! ## Why bundling is safe
+//!
+//! Google + Azure desktop client IDs aren't secrets — they appear in
+//! every OAuth URL and id_token `aud` claim. Microsoft and Google both
+//! document them as public. Azure native/public clients run PKCE and
+//! have no client_secret at all (so there's no
+//! `BUNDLED_AZURE_CLIENT_SECRET`). The Google client_secret is also
+//! "public" in the OAuth sense; the trust boundary is the
+//! gateway-side signature + `aud` verification (see
+//! `thclaws-technical-manual/sso.md`).
 
 use crate::error::{Error, Result};
 use crate::policy::SsoPolicy;
@@ -78,14 +97,13 @@ impl BuiltinProvider {
         }
     }
 
-    /// `true` when the provider's client_id env var is set — i.e. the
-    /// "Sign in with …" button can actually launch a flow. UI consults
-    /// this to decide which buttons to render.
+    /// `true` when the provider's client_id is resolvable — either
+    /// from `std::env::var` (local-dev `.env` path) or the compile-time
+    /// `BUNDLED_*_CLIENT_ID` baked in by `build.rs` (official release
+    /// builds). UI consults this to decide which buttons to render.
     pub fn is_configured(&self) -> bool {
         let (id_env, _) = self.env_keys();
-        std::env::var(id_env)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false)
+        resolve_env_or_bundled(id_env).is_some()
     }
 
     /// Resolve into the `SsoPolicy` shape the existing
@@ -95,19 +113,12 @@ impl BuiltinProvider {
     /// policy come from".
     pub fn resolve(&self) -> Result<SsoPolicy> {
         let (id_env, secret_env) = self.env_keys();
-        let client_id = std::env::var(id_env)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "{id_env} is not set — add it to .env or your environment"
-                ))
-            })?;
-        let client_secret = std::env::var(secret_env)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let client_id = resolve_env_or_bundled(id_env).ok_or_else(|| {
+            Error::Config(format!(
+                "{id_env} is not set — add it to .env or your environment, or rebuild with the BUNDLED_* env var"
+            ))
+        })?;
+        let client_secret = resolve_env_or_bundled(secret_env);
         Ok(SsoPolicy {
             enabled: true,
             provider: "oidc".into(),
@@ -118,6 +129,44 @@ impl BuiltinProvider {
             // Secret already resolved above — no env-name indirection.
             client_secret_env: None,
         })
+    }
+}
+
+/// Resolve a credential value by checking runtime env first (so
+/// local-dev `.env` and shell `export` win) then falling back to the
+/// compile-time `BUNDLED_<name>` value baked in by `build.rs`.
+/// Returns `None` only when both are empty / unset.
+fn resolve_env_or_bundled(name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(name) {
+        let trimmed = v.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    bundled_value(name).map(str::to_string)
+}
+
+/// Look up the compile-time `BUNDLED_<name>` value. Each variant is
+/// a separate `env!()` so the lookup table stays a `const`-foldable
+/// `match` — no runtime allocation, no hashmap, no surprises if
+/// `build.rs` forgets to emit one (compile error instead of silent
+/// `None` for that key).
+fn bundled_value(name: &str) -> Option<&'static str> {
+    let raw = match name {
+        "GOOGLE_CLIENT_ID" => env!("BUNDLED_GOOGLE_CLIENT_ID"),
+        "GOOGLE_CLIENT_SECRET" => env!("BUNDLED_GOOGLE_CLIENT_SECRET"),
+        "AZURE_CLIENT_ID" => env!("BUNDLED_AZURE_CLIENT_ID"),
+        // No `BUNDLED_AZURE_CLIENT_SECRET` — Azure native/public clients
+        // run PKCE without a secret. Return empty so the secret-resolve
+        // path falls through to None cleanly.
+        "AZURE_CLIENT_SECRET" => "",
+        _ => "",
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -144,4 +193,72 @@ pub fn current_session_any() -> Option<(BuiltinProvider, super::Session)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // bundled_value / resolve_env_or_bundled mutate via std::env::var.
+    // Serialise the tests so a sibling test doesn't observe a flapping
+    // env state. Cheap; only this small module is affected.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn bundled_value_returns_none_for_empty_or_unknown() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Empty bundled (the default for source builds without the CI
+        // env) → None. Unknown name → None.
+        assert!(bundled_value("DOES_NOT_EXIST").is_none());
+        // `AZURE_CLIENT_SECRET` is explicitly empty-mapped in
+        // `bundled_value` (no secret for Azure public clients).
+        assert!(bundled_value("AZURE_CLIENT_SECRET").is_none());
+    }
+
+    #[test]
+    fn resolve_env_or_bundled_prefers_env_over_bundled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("GOOGLE_CLIENT_ID", "from-env");
+        let resolved = resolve_env_or_bundled("GOOGLE_CLIENT_ID");
+        std::env::remove_var("GOOGLE_CLIENT_ID");
+        // Env wins even if BUNDLED_GOOGLE_CLIENT_ID was injected at
+        // compile time (this test passes either way).
+        assert_eq!(resolved.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn resolve_env_or_bundled_treats_blank_env_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("GOOGLE_CLIENT_ID", "   ");
+        let resolved = resolve_env_or_bundled("GOOGLE_CLIENT_ID");
+        std::env::remove_var("GOOGLE_CLIENT_ID");
+        // Blank env falls through to bundled (which may be empty too
+        // in the source-build case). Either way, never returns the
+        // blank string itself.
+        match resolved {
+            Some(s) => assert!(!s.trim().is_empty()),
+            None => {} // source build, no bundled value — fine
+        }
+    }
+
+    #[test]
+    fn is_configured_returns_true_when_env_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("AZURE_CLIENT_ID", "test-azure-id");
+        let ok = BuiltinProvider::Azure.is_configured();
+        std::env::remove_var("AZURE_CLIENT_ID");
+        assert!(ok);
+    }
+
+    #[test]
+    fn resolve_carries_through_env_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("AZURE_CLIENT_ID", "test-azure-id");
+        let policy = BuiltinProvider::Azure.resolve().expect("resolve");
+        std::env::remove_var("AZURE_CLIENT_ID");
+        assert_eq!(policy.client_id, "test-azure-id");
+        // Azure public client → no secret returned even if env is unset.
+        assert!(policy.client_secret.is_none());
+    }
 }

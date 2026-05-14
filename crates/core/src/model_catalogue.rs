@@ -21,7 +21,7 @@
 //! reject old caches cleanly without crashing.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 /// Schema history:
@@ -109,9 +109,12 @@ pub struct ProviderCatalogue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_context: Option<u32>,
     /// Real model ids (exactly as the provider's API returns them)
-    /// mapped to their entry.
+    /// mapped to their entry. `BTreeMap` (not `HashMap`) so serde
+    /// emits keys in deterministic alphabetical order — `make
+    /// catalogue` produces clean line-by-line diffs instead of a
+    /// 6K-line key-shuffle whenever one row changes.
     #[serde(default)]
-    pub models: HashMap<String, ModelEntry>,
+    pub models: BTreeMap<String, ModelEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,15 +127,16 @@ pub struct Catalogue {
     pub fetched_at: String,
     /// Provider name → its catalogue. Provider names match the strings
     /// `provider_kind_name()` returns, so `ProviderKind::detect(id)`
-    /// gives the map key directly.
+    /// gives the map key directly. `BTreeMap` for deterministic
+    /// serde order — see `ProviderCatalogue::models` docstring.
     #[serde(default)]
-    pub providers: HashMap<String, ProviderCatalogue>,
+    pub providers: BTreeMap<String, ProviderCatalogue>,
     /// User-friendly id → real id. Lets callers pass `claude-sonnet-4-6`
     /// and have it resolved to the current canonical dated variant
     /// (`claude-sonnet-4-6-20261001`). Entries are optional — bare real
-    /// ids still look up directly.
+    /// ids still look up directly. `BTreeMap` for stable diffs.
     #[serde(default)]
-    pub aliases: HashMap<String, String>,
+    pub aliases: BTreeMap<String, String>,
     /// Last-resort fallback when neither an entry nor a provider default
     /// is known.
     #[serde(default)]
@@ -442,13 +446,29 @@ impl EffectiveCatalogue {
     /// provider's live `/v1/models` endpoint.
     pub fn list_models_for_provider(&self, provider: &str) -> Vec<(String, ModelEntry)> {
         let mut out: HashMap<String, ModelEntry> = HashMap::new();
+        // Back-compat: older caches keyed AgentSdk as "agent-sdk"
+        // (the pre-fix `provider_kind_name` return value). The
+        // canonical key is now "anthropic-agent" — accept both at
+        // lookup time so an outdated `~/.config/thclaws/model_catalogue.json`
+        // doesn't surface as an empty picker until the user
+        // remembers to `/models refresh`.
+        let legacy_alias: Option<&str> = match provider {
+            "anthropic-agent" => Some("agent-sdk"),
+            _ => None,
+        };
         if let Some(pc) = self.baseline.providers.get(provider) {
             for (id, e) in &pc.models {
                 out.insert(id.clone(), e.clone());
             }
         }
         if let Some(c) = &self.cache {
-            if let Some(pc) = c.providers.get(provider) {
+            let mut cache_provider = c.providers.get(provider);
+            if cache_provider.is_none() {
+                if let Some(alias) = legacy_alias {
+                    cache_provider = c.providers.get(alias);
+                }
+            }
+            if let Some(pc) = cache_provider {
                 for (id, e) in &pc.models {
                     // Cache row wins on metadata it actually carries,
                     // but when the cache lacks a field that the baseline
@@ -694,11 +714,53 @@ pub enum OverrideScope {
 /// catalogue JSON. Mirrors `ProviderKind::name` except for
 /// `Ollama`/`OllamaAnthropic`/`AgentSdk` which we namespace
 /// differently in the catalogue for clarity.
+/// Render a catalogue model id as the canonical, routable form for the
+/// `/models` slash command + the GUI model picker.
+///
+/// Strategy:
+/// 1. If the id is already qualified with the provider's path segment
+///    (e.g. catalogue stored `dashscope/qwen-vl-plus` or
+///    `agent/claude-sonnet-4-6`), keep it as-is. **Never double-prefix.**
+/// 2. Else if `ProviderKind::detect(id)` resolves to the same provider
+///    we're rendering for, the bare id is already self-routing (e.g.
+///    Anthropic's `claude-sonnet-4-6`, OpenAI's `gpt-4o`, DashScope's
+///    `qwen-max`). Keep bare.
+/// 3. Else prefix with `<provider>/` so `/model <copied-id>` can route
+///    through `ProviderKind::detect`. This is what OpenRouter rows
+///    rely on — the catalogue stores them bare (`google/gemma-…:free`)
+///    and the prefix makes them routable.
+///
+/// The pre-fix logic compared `ProviderKind::name()` to
+/// `provider_kind_name()` for the "same provider" check, which silently
+/// diverged on AgentSdk (`anthropic-agent` vs `agent-sdk`) and caused
+/// every AgentSdk row to over-prefix. Two same-source-of-truth checks
+/// here instead: literal prefix match + detect-to-the-same-kind.
+pub fn canonical_model_id(provider_name: &str, id: &str) -> String {
+    let prefix = format!("{}/", provider_name);
+    if id.starts_with(&prefix) {
+        return id.to_string();
+    }
+    if let Some(detected) = crate::providers::ProviderKind::detect(id) {
+        if provider_kind_name(detected) == provider_name {
+            return id.to_string();
+        }
+    }
+    format!("{provider_name}/{id}")
+}
+
 pub fn provider_kind_name(k: crate::providers::ProviderKind) -> &'static str {
     use crate::providers::ProviderKind;
     match k {
         ProviderKind::Anthropic => "anthropic",
-        ProviderKind::AgentSdk => "agent-sdk",
+        // Must match `ProviderKind::name()` so a round-trip via
+        // `detect_provider()` → `provider_kind_name(kind)` returns
+        // the same key. Pre-fix this returned `"agent-sdk"` while
+        // `name()` returned `"anthropic-agent"`; the divergence
+        // broke /models for the agent/* provider — `/model<enter>`
+        // looked up the catalogue under "anthropic-agent", missed
+        // the renamed `agent-sdk` section, and the picker never
+        // opened.
+        ProviderKind::AgentSdk => "anthropic-agent",
         ProviderKind::OpenAI => "openai",
         ProviderKind::OpenAIResponses => "openai-responses",
         ProviderKind::ChatGptCodex => "chatgpt-codex",
@@ -717,6 +779,7 @@ pub fn provider_kind_name(k: crate::providers::ProviderKind) -> &'static str {
         ProviderKind::DeepSeek => "deepseek",
         ProviderKind::ThaiLLM => "thaillm",
         ProviderKind::Nvidia => "nvidia",
+        ProviderKind::OpenCodeGo => "opencode-go",
         ProviderKind::Minimax => "minimax",
     }
 }
@@ -856,6 +919,85 @@ impl std::fmt::Display for RefreshError {
             RefreshError::Io(s) => write!(f, "io: {s}"),
             RefreshError::NoHome => write!(f, "no home directory"),
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_id_tests {
+    use super::canonical_model_id;
+
+    // Anthropic / OpenAI / Gemini / DashScope: catalogue stores bare,
+    // self-routing ids — the helper must keep them bare and NEVER
+    // prepend the provider name.
+    #[test]
+    fn anthropic_bare_id_stays_bare() {
+        assert_eq!(
+            canonical_model_id("anthropic", "claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn openai_bare_id_stays_bare() {
+        assert_eq!(canonical_model_id("openai", "gpt-4o"), "gpt-4o");
+    }
+
+    #[test]
+    fn gemini_bare_id_stays_bare() {
+        assert_eq!(
+            canonical_model_id("gemini", "gemini-2.5-flash"),
+            "gemini-2.5-flash"
+        );
+    }
+
+    #[test]
+    fn dashscope_bare_qwen_id_stays_bare() {
+        assert_eq!(canonical_model_id("dashscope", "qwen-max"), "qwen-max");
+    }
+
+    // The user-reported bug: catalogue rows for DashScope had a mix of
+    // bare ids AND ids that already included the `dashscope/` prefix.
+    // The pre-fix logic prepended a second one. Helper must idempotently
+    // keep already-qualified ids unchanged.
+    #[test]
+    fn dashscope_already_prefixed_id_is_not_double_prefixed() {
+        assert_eq!(
+            canonical_model_id("dashscope", "dashscope/qwen-vl-plus"),
+            "dashscope/qwen-vl-plus"
+        );
+    }
+
+    // OpenRouter is the original motivation: catalogue rows look like
+    // `google/gemma-3-27b-it:free` (bare, no `openrouter/` prefix), and
+    // those don't route via `ProviderKind::detect` without qualification.
+    #[test]
+    fn openrouter_bare_vendor_id_gets_prefixed() {
+        assert_eq!(
+            canonical_model_id("openrouter", "google/gemma-3-27b-it:free"),
+            "openrouter/google/gemma-3-27b-it:free"
+        );
+    }
+
+    // OpenRouter ids that already include the prefix in the catalogue
+    // stay as-is.
+    #[test]
+    fn openrouter_already_prefixed_id_stays_single_prefixed() {
+        assert_eq!(
+            canonical_model_id("openrouter", "openrouter/anthropic/claude-sonnet-4-6"),
+            "openrouter/anthropic/claude-sonnet-4-6"
+        );
+    }
+
+    // AgentSdk: pre-fix the name() vs provider_kind_name() mismatch
+    // (`anthropic-agent` vs `agent-sdk`) sent the detect-arm to the
+    // wrong key. Both functions now return `"anthropic-agent"`; this
+    // test pins the canonical post-rename name.
+    #[test]
+    fn agent_sdk_id_stays_single_prefixed() {
+        assert_eq!(
+            canonical_model_id("anthropic-agent", "agent/claude-sonnet-4-6"),
+            "agent/claude-sonnet-4-6"
+        );
     }
 }
 
@@ -1177,6 +1319,73 @@ mod tests {
         assert_eq!(rows[0].1.source.as_deref(), Some("user scan"));
         // Cache-only id is present.
         assert_eq!(rows[1].1.context, Some(32_768));
+    }
+
+    /// User-reported bug: on /provider anthropic-agent, `/model<enter>`
+    /// asked the catalogue for "anthropic-agent" (the value of
+    /// `Kind::name()` + `detect_provider()`), but the baseline JSON
+    /// keyed AgentSdk under "agent-sdk" — so `list_models_for_provider`
+    /// returned 0 rows and the model-picker modal never opened.
+    ///
+    /// Post-fix, both names point at the same provider rows. The
+    /// baseline+seed code uses the canonical "anthropic-agent" key;
+    /// older user caches that still use "agent-sdk" are picked up via
+    /// the legacy-alias fallback in `list_models_for_provider`.
+    #[test]
+    fn list_models_for_provider_resolves_anthropic_agent() {
+        let baseline = Catalogue::from_json_str(
+            r#"{
+            "schema": 3,
+            "providers": {
+                "anthropic-agent": {
+                    "default_context": 200000,
+                    "models": {
+                        "agent/claude-sonnet-4-6": {"context": 200000}
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        let eff = EffectiveCatalogue {
+            cache: None,
+            baseline,
+            overrides: HashMap::new(),
+        };
+        let rows = eff.list_models_for_provider("anthropic-agent");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "agent/claude-sonnet-4-6");
+    }
+
+    /// Back-compat: a user with a `/models refresh` cache written by
+    /// the pre-fix binary keyed AgentSdk as "agent-sdk". The fixed
+    /// `list_models_for_provider` accepts that legacy key when called
+    /// with the canonical "anthropic-agent" name, so the picker opens
+    /// for users who haven't yet `/models refresh`'d.
+    #[test]
+    fn list_models_for_provider_legacy_agent_sdk_cache_falls_back() {
+        let baseline = Catalogue::from_json_str(r#"{"schema": 3, "providers": {}}"#).unwrap();
+        let cache = Catalogue::from_json_str(
+            r#"{
+            "schema": 3,
+            "providers": {
+                "agent-sdk": {
+                    "default_context": 200000,
+                    "models": {
+                        "agent/claude-opus-4-6": {"context": 200000}
+                    }
+                }
+            }
+        }"#,
+        );
+        let eff = EffectiveCatalogue {
+            cache,
+            baseline,
+            overrides: HashMap::new(),
+        };
+        let rows = eff.list_models_for_provider("anthropic-agent");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "agent/claude-opus-4-6");
     }
 
     #[test]

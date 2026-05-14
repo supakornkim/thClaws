@@ -134,7 +134,96 @@ pub async fn login(policy: &SsoPolicy) -> Result<Session> {
 
     storage::save(&session)?;
     update_cache(Some(session.clone()));
+    // After a successful sign-in, ask the gateway to mint an access
+    // key bound to this identity and stash it in the keychain. Lets
+    // a user "Sign in with Microsoft" once and have the per-provider
+    // gateway toggles work without a second copy-paste step. The
+    // mint is best-effort + non-blocking — gateway unreachable
+    // doesn't block sign-in.
+    spawn_gateway_key_mint(session.clone());
     Ok(session)
+}
+
+/// Fire-and-forget gateway key mint. No-ops when:
+/// - The session has no `id_token` (rare — OIDC providers issue one
+///   for `openid` scope, but some misconfigured IdPs don't).
+/// - The user already has a gateway access key configured (env var
+///   `THCLAWS_GATEWAY_API_KEY` or keychain). Re-minting on every
+///   sign-in would churn keys and leave dangling rows on the
+///   gateway side.
+///
+/// Failures land on stderr but don't fail the login itself.
+fn spawn_gateway_key_mint(session: storage::Session) {
+    let id_token = match session.id_token.clone() {
+        Some(t) if !t.is_empty() => t,
+        _ => return,
+    };
+    if std::env::var("THCLAWS_GATEWAY_API_KEY")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return;
+    }
+    if crate::secrets::get("gateway").is_some() {
+        return;
+    }
+    let label = gateway_key_label(&session);
+    tokio::spawn(async move {
+        if let Err(e) = mint_gateway_key(&id_token, &label).await {
+            eprintln!("[gateway] auto-mint after SSO sign-in failed: {e}");
+        }
+    });
+}
+
+/// Label recorded on the minted key (visible in
+/// `GET /v1/keys`). Email + a "desktop" tag is enough to
+/// distinguish keys across machines + identities.
+fn gateway_key_label(session: &storage::Session) -> String {
+    let who = session
+        .email
+        .as_deref()
+        .or(session.name.as_deref())
+        .unwrap_or("desktop");
+    format!("thclaws-desktop ({who})")
+}
+
+async fn mint_gateway_key(id_token: &str, label: &str) -> Result<()> {
+    let base = std::env::var("THCLAWS_GATEWAY_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::providers::thclaws_gateway::GATEWAY_BASE_URL.to_string());
+    let url = format!("{}/v1/keys", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "id_token": id_token,
+        "label": label,
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Tool(format!("POST {url}: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let snippet = resp.text().await.unwrap_or_default();
+        return Err(Error::Tool(format!(
+            "gateway /v1/keys → {status}: {snippet}"
+        )));
+    }
+    let parsed: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| Error::Tool(format!("decode gateway response: {e}")))?;
+    let key = parsed
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Tool("gateway response missing 'key' field".into()))?;
+    crate::secrets::set("gateway", key)
+        .map_err(|e| Error::Tool(format!("store gateway key in keychain: {e}")))?;
+    eprintln!("[gateway] minted access key (label: {label})");
+    Ok(())
 }
 
 /// Clear the cached session for `policy.issuer_url`. Idempotent —
@@ -746,5 +835,58 @@ mod tests {
         for c in a.chars() {
             assert!(c.is_ascii_alphanumeric() || c == '-' || c == '_');
         }
+    }
+
+    fn fixture_session() -> storage::Session {
+        storage::Session {
+            issuer: "https://accounts.google.com".into(),
+            client_id: "client".into(),
+            access_token: "at".into(),
+            id_token: Some("eyJ.eyJ.sig".into()),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            email: Some("alice@example.com".into()),
+            name: Some("Alice".into()),
+            sub: Some("subj".into()),
+        }
+    }
+
+    #[test]
+    fn gateway_key_label_uses_email_when_present() {
+        let s = fixture_session();
+        let label = gateway_key_label(&s);
+        assert_eq!(label, "thclaws-desktop (alice@example.com)");
+    }
+
+    #[test]
+    fn gateway_key_label_falls_back_to_name_then_static() {
+        let mut s = fixture_session();
+        s.email = None;
+        let label = gateway_key_label(&s);
+        assert_eq!(label, "thclaws-desktop (Alice)");
+
+        s.name = None;
+        let label = gateway_key_label(&s);
+        assert_eq!(label, "thclaws-desktop (desktop)");
+    }
+
+    /// `spawn_gateway_key_mint` is fire-and-forget; the public-facing
+    /// guarantee is that it bails early when no id_token is present
+    /// (so we don't synthesise a bogus POST). The early-return is the
+    /// behavior we can test without standing up a real HTTP server.
+    #[test]
+    fn spawn_gateway_key_mint_no_ops_when_id_token_missing() {
+        let mut s = fixture_session();
+        s.id_token = None;
+        // Smoke: the helper must not panic / queue a task / write
+        // anything when the session has no id_token. We can't observe
+        // the absence of a spawned task directly, but we can verify
+        // the function returns without error and doesn't touch the
+        // keychain by asserting `secrets::get("gateway")` stays
+        // unchanged across the call.
+        let before = crate::secrets::get("gateway");
+        spawn_gateway_key_mint(s);
+        let after = crate::secrets::get("gateway");
+        assert_eq!(before, after);
     }
 }

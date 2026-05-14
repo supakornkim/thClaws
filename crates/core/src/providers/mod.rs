@@ -50,6 +50,8 @@ pub mod ollama;
 pub mod ollama_cloud;
 pub mod openai;
 pub mod openai_responses;
+pub mod opencode_go;
+pub mod thclaws_gateway;
 
 /// Registry of supported providers. Every new provider needs exactly one
 /// variant here + matching arms in the methods below; the compiler catches
@@ -87,6 +89,7 @@ pub enum ProviderKind {
     ThaiLLM,
     Nvidia,
     Minimax,
+    OpenCodeGo,
 }
 
 impl ProviderKind {
@@ -112,6 +115,7 @@ impl ProviderKind {
         Self::ThaiLLM,
         Self::Nvidia,
         Self::Minimax,
+        Self::OpenCodeGo,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -137,6 +141,7 @@ impl ProviderKind {
             Self::ThaiLLM => "thaillm",
             Self::Nvidia => "nvidia",
             Self::Minimax => "minimax",
+            Self::OpenCodeGo => "opencode-go",
         }
     }
 
@@ -208,6 +213,11 @@ impl ProviderKind {
             // API). Models use the `minimax/<id>` prefix; the prefix is
             // stripped before the request reaches the upstream.
             Self::Minimax => "minimax/MiniMax-M2",
+            // OpenCodeGo (opencode.ai) — OpenAI-compatible hosted inference.
+            // Models use the `opencode-go/<id>` prefix (e.g.
+            // `opencode-go/kimi-k2.6`); the prefix is stripped before
+            // the request reaches the upstream.
+            Self::OpenCodeGo => "opencode-go/deepseek-v4-flash",
         }
     }
 
@@ -230,6 +240,7 @@ impl ProviderKind {
             Self::ThaiLLM => Some("THAILLM_BASE_URL"),
             Self::Nvidia => Some("NVIDIA_BASE_URL"),
             Self::Minimax => Some("MINIMAX_BASE_URL"),
+            Self::OpenCodeGo => Some("OPENCODE_GO_BASE_URL"),
             _ => None,
         }
     }
@@ -286,6 +297,8 @@ impl ProviderKind {
             // tenants with "invalid api key (2049)" — .io is the
             // current public OpenAI-compatible URL.
             Self::Minimax => Some("https://api.minimax.io/v1"),
+            // OpenCodeGo — hosted gateway at opencode.ai.
+            Self::OpenCodeGo => Some("https://opencode.ai/zen/go/v1"),
             _ => None,
         }
     }
@@ -332,6 +345,7 @@ impl ProviderKind {
             Self::ThaiLLM => Some("THAILLM_API_KEY"),
             Self::Nvidia => Some("NVIDIA_API_KEY"),
             Self::Minimax => Some("MINIMAX_API_KEY"),
+            Self::OpenCodeGo => Some("OPENCODE_GO_API_KEY"),
         }
     }
 
@@ -433,6 +447,7 @@ impl ProviderKind {
             | Self::OpenAICompat
             | Self::DeepSeek
             | Self::Nvidia
+            | Self::OpenCodeGo
             | Self::Minimax => None,
         }
     }
@@ -529,6 +544,8 @@ impl ProviderKind {
             // OpenRouter proxies the same models as `openrouter/nvidia/...`;
             // the `openrouter/` check above catches those first.
             Some(Self::Nvidia)
+        } else if model.starts_with("opencode-go/") {
+            Some(Self::OpenCodeGo)
         } else {
             None
         }
@@ -934,6 +951,27 @@ pub async fn build_all_models_payload() -> String {
             _ => Vec::new(),
         }
     };
+    let opencodego_live: Vec<String> = {
+        let key = std::env::var("OPENCODE_GO_API_KEY").ok();
+        match key {
+            Some(k) => {
+                let base = std::env::var("OPENCODE_GO_BASE_URL")
+                    .unwrap_or_else(|_| crate::providers::opencode_go::DEFAULT_API_URL.to_string());
+                let provider =
+                    crate::providers::opencode_go::OpencodeGoProvider::new(k).with_base_url(base);
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(1500),
+                    provider.list_models(),
+                )
+                .await
+                {
+                    Ok(Ok(models)) => models.into_iter().map(|m| m.id).collect(),
+                    _ => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        }
+    };
     let mut groups: Vec<serde_json::Value> = Vec::new();
     for kind in ProviderKind::ALL {
         let name = kind.name();
@@ -956,6 +994,11 @@ pub async fn build_all_models_payload() -> String {
         }
         if matches!(kind, ProviderKind::Ollama) {
             for id in &ollama_live {
+                model_ids.entry(id.clone()).or_insert(None);
+            }
+        }
+        if matches!(kind, ProviderKind::OpenCodeGo) {
+            for id in &opencodego_live {
                 model_ids.entry(id.clone()).or_insert(None);
             }
         }
@@ -1003,6 +1046,7 @@ pub fn auto_fallback_model(cfg: &crate::config::AppConfig) -> Option<String> {
         ProviderKind::DeepSeek,
         ProviderKind::ThaiLLM,
         ProviderKind::Minimax,
+        ProviderKind::OpenCodeGo,
     ];
     for kind in ORDER {
         if kind_has_credentials(Some(*kind)) {
@@ -1322,6 +1366,48 @@ mod tests {
             Some("http://thaillm.or.th/api/v1")
         );
         assert_eq!(ProviderKind::ThaiLLM.name(), "thaillm");
+    }
+
+    #[test]
+    fn detect_opencodego_prefix_routes_to_opencodego_provider() {
+        assert_eq!(
+            ProviderKind::detect("opencode-go/kimi-k2.6"),
+            Some(ProviderKind::OpenCodeGo)
+        );
+        assert_eq!(
+            ProviderKind::detect("opencode-go/deepseek-v4-flash"),
+            Some(ProviderKind::OpenCodeGo)
+        );
+        assert_eq!(
+            ProviderKind::detect("opencode-go/qwen3.6-plus"),
+            Some(ProviderKind::OpenCodeGo)
+        );
+        // Bare model without prefix does NOT route to OpenCodeGo.
+        assert!(
+            !matches!(
+                ProviderKind::detect("kimi-k2.6"),
+                Some(ProviderKind::OpenCodeGo)
+            ),
+            "bare model ids without opencode-go/ prefix must not match OpenCodeGo"
+        );
+        // Provider properties match the expected values.
+        assert_eq!(
+            ProviderKind::OpenCodeGo.api_key_env(),
+            Some("OPENCODE_GO_API_KEY")
+        );
+        assert_eq!(
+            ProviderKind::OpenCodeGo.endpoint_env(),
+            Some("OPENCODE_GO_BASE_URL")
+        );
+        assert_eq!(
+            ProviderKind::OpenCodeGo.default_endpoint(),
+            Some("https://opencode.ai/zen/go/v1")
+        );
+        assert_eq!(ProviderKind::OpenCodeGo.name(), "opencode-go");
+        assert_eq!(
+            ProviderKind::OpenCodeGo.default_model(),
+            "opencode-go/deepseek-v4-flash"
+        );
     }
 
     #[test]
